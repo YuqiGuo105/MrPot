@@ -1,0 +1,237 @@
+name: Maven CI/CD (Pre/Post + Version + Single Build/Test)
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: "17"
+  SPRING_PROFILES_ACTIVE: test
+  spring.flyway.enabled: "false"
+  CHECK_TODO: "true"
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # .pre (two jobs)
+  # ──────────────────────────────────────────────────────────────
+  sdlc_control_pre:
+    name: S-SDLC Control Pre Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Temurin JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Check for large tracked files (>10MB)
+        shell: bash
+        run: |
+          set -euo pipefail
+          found="$(git ls-files -z | xargs -0 -I{} -- du -m {} | awk '$1 > 10 {print $0}')"
+          if [[ -n "$found" ]]; then
+            echo "::warning ::Large tracked files detected (>10MB):"
+            echo "$found"
+          else
+            echo "No large tracked files."
+          fi
+
+      - name: Basic secret pattern scan (non-blocking)
+        shell: bash
+        run: |
+          set -euo pipefail
+          hits="$(git grep -nE 'BEGIN RSA PRIVATE KEY|AWS_SECRET_ACCESS_KEY|google_api_key|ghp_[A-Za-z0-9]+' -- || true)"
+          if [[ -n "$hits" ]]; then
+            echo "::warning ::Potential secret-like patterns found:"
+            echo "$hits"
+          else
+            echo "No secret-like patterns found."
+          fi
+
+  sdlc_pre:
+    name: SDLC Pre Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Temurin JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Fail if TODO/FIXME left in code
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${CHECK_TODO:-true}" != "true" ]]; then
+            echo "TODO/FIXME check disabled (CHECK_TODO=false)"; exit 0; fi
+          matches="$(
+            git grep -nE 'TODO|FIXME' -- \
+              'src' 'pom.xml' \
+              ':!src/**/generated/**' \
+              ':!**/*.md' ':!**/*.adoc' ':!**/*.rst' \
+              ':!**/*.json' ':!**/*.yaml' ':!**/*.yml' \
+              ':!**/*.lock' ':!**/*.svg' ':!**/*.png' || true
+          )"
+          filtered="$(printf '%s\n' "$matches" | grep -vE 'ci:allow-(todo|fixme)' || true)"
+          if [[ -n "$filtered" ]]; then
+            echo "::group::TODO/FIXME found (add 'ci:allow-todo' / 'ci:allow-fixme' to suppress a line)"
+            printf '%s\n' "$filtered"; echo "::endgroup::"
+            echo "::error ::Found TODO/FIXME markers in source files."
+            exit 1
+          fi
+          echo "No TODO/FIXME markers in source files."
+
+      - name: (Optional) Checkstyle if configured
+        run: mvn -q -DskipTests=true checkstyle:check || true
+
+      - name: (Optional) SpotBugs if configured
+        run: mvn -q -DskipTests=true com.github.spotbugs:spotbugs-maven-plugin:check || true
+
+  # ──────────────────────────────────────────────────────────────
+  # version-calculator
+  # ──────────────────────────────────────────────────────────────
+  version_calculator:
+    name: version-calculator
+    runs-on: ubuntu-latest
+    needs: [sdlc_control_pre, sdlc_pre]
+    outputs:
+      VERSION: ${{ steps.calc.outputs.VERSION }}
+    steps:
+      - name: Checkout (fetch tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: calc
+        name: Compute version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" =~ ^v[0-9] ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            POM_VER=$(mvn -q -Dexec.executable=echo -Dexec.args='${project.version}' --non-recursive org.codehaus.mojo:exec-maven-plugin:3.3.0:exec)
+            GIT_SHA=$(git rev-parse --short=7 HEAD)
+            VERSION="${POM_VER}+${GIT_SHA}"
+          fi
+          echo "VERSION=$VERSION" | tee -a "$GITHUB_OUTPUT"
+
+  # ──────────────────────────────────────────────────────────────
+  # build-test (single job: compile + tests + package + artifacts)
+  # ──────────────────────────────────────────────────────────────
+  build_test:
+    name: build-test
+    runs-on: ubuntu-latest
+    needs: version_calculator
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Temurin JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Set calculated version in pom (non-tag builds)
+        if: ${{ github.ref_type != 'tag' }}
+        run: mvn -q -B versions:set -DnewVersion='${{ needs.version_calculator.outputs.VERSION }}' -DgenerateBackupPoms=false
+
+      - name: Build & Test
+        run: mvn -B -U -DskipITs=true clean verify
+
+      - name: Package Boot JAR
+        run: mvn -B -DskipTests=true package
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-${{ needs.version_calculator.outputs.VERSION }}
+          path: target/*.jar
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload surefire test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/**
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────
+  # .post (two jobs depend on build_test)
+  # ──────────────────────────────────────────────────────────────
+  sdlc_control_post:
+    name: S-SDLC Control Post Checks
+    runs-on: ubuntu-latest
+    needs: build_test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          {
+            echo "commit_sha=$(git rev-parse HEAD)"
+            echo "branch_ref=${GITHUB_REF}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_number=${GITHUB_RUN_NUMBER}"
+            echo "built_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > out/build-metadata.txt
+          cat out/build-metadata.txt
+
+      - name: Upload build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata-${{ github.run_number }}
+          path: out/build-metadata.txt
+          retention-days: 7
+
+  sdlc_post:
+    name: SDLC Post Checks
+    runs-on: ubuntu-latest
+    needs: build_test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download surefire test reports
+        uses: actions/download-artifact@v4
+        with:
+          name: surefire-reports
+          path: test-reports
+
+      - name: Summarize unit test results
+        shell: bash
+        run: |
+          set -euo pipefail
+          total_xml=$(ls -1 test-reports/*.xml 2>/dev/null | wc -l | xargs)
+          echo "Collected $total_xml surefire XML report(s)."
+          if grep -E '<failure|<error' -R test-reports >/dev/null 2>&1; then
+            echo "::warning ::Unit test failures or errors were detected; see the report artifacts."
+          else
+            echo "All unit tests passed."
+          fi
