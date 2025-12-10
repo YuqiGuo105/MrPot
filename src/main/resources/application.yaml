@@ -83,6 +83,13 @@ spring:
     #     # 这里一般保持默认即可
     #     ...
 
+# === Swagger UI / OpenAPI 文档 ===
+springdoc:
+  swagger-ui:
+    path: /swagger-ui
+  api-docs:
+    path: /v3/api-docs
+
 # === Actuator / 监控（可选）===
 management:
   endpoints:
