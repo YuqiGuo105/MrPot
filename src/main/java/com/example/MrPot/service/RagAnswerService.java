@@ -5,6 +5,8 @@ import com.example.MrPot.model.RagAnswerRequest;
 import com.example.MrPot.model.RagQueryRequest;
 import com.example.MrPot.model.RagRetrievalResult;
 import com.example.MrPot.model.ThinkingEvent;
+import com.example.MrPot.tools.ToolProfile;
+import com.example.MrPot.tools.ToolRegistry;
 import lombok.RequiredArgsConstructor;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
@@ -22,6 +24,7 @@ public class RagAnswerService {
     private final RagRetrievalService ragRetrievalService;
     private final RedisChatMemoryService chatMemoryService;
     private final Map<String, ChatClient> chatClients;
+    private final ToolRegistry toolRegistry;
 
     private static final int DEFAULT_TOP_K = 3;
     private static final double DEFAULT_MIN_SCORE = 0.60;
@@ -40,6 +43,9 @@ public class RagAnswerService {
         RagAnswerRequest.ResolvedSession session = request.resolveSession();
         var history = chatMemoryService.loadHistory(session.id());
         String prompt = buildPrompt(request.question(), retrieval, chatMemoryService.renderHistory(history));
+
+        ToolProfile profile = request.resolveToolProfile(ToolProfile.BASIC_CHAT);
+        List<String> toolBeanNames = toolRegistry.getFunctionBeanNamesForProfile(profile);
 
         var response = chatClient.prompt()
                 .system("You are Mr Pot, a helpful assistant. Use the provided context and chat history to answer succinctly.")
