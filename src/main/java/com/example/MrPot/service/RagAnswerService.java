@@ -4,6 +4,7 @@ import com.example.MrPot.model.RagAnswer;
 import com.example.MrPot.model.RagAnswerRequest;
 import com.example.MrPot.model.RagQueryRequest;
 import com.example.MrPot.model.RagRetrievalResult;
+import com.example.MrPot.model.ScoredDocument;
 import com.example.MrPot.model.ThinkingEvent;
 import com.example.MrPot.tools.ToolProfile;
 import com.example.MrPot.tools.ToolRegistry;
@@ -31,26 +32,61 @@ public class RagAnswerService {
     private static final int DEFAULT_TOP_K = 3;
     private static final double DEFAULT_MIN_SCORE = 0.60;
 
+    // Minimum similarity score required to consider a question "in scope" of the KB
+    private static final double MIN_KB_SCORE_FOR_ANSWER = 0.15;
+
+    // Fixed fallback reply when the question is beyond the knowledge base
+    private static final String OUT_OF_SCOPE_REPLY = "I can only answer Yuqi's related stuff.";
+
+    // Short instruction for all LLM calls
+    private static final String RICH_TEXT_INSTRUCTION =
+            "Be brief. Prefer a single plain sentence. " +
+                    "Only if structure helps, return a small HTML fragment (no <html>/<body>).";
+
+    // Shared base system prompt
+    private static final String SYSTEM_BASE =
+            "You are Mr Pot, Yuqi's assistant. Use only the given history and context. " +
+                    "If they do not contain the answer, reply exactly: \"" + OUT_OF_SCOPE_REPLY + "\". ";
+
     /**
      * Non-streaming RAG answer:
      * - Retrieve related documents
-     * - Build prompt with history + context
-     * - Call LLM once
+     * - If out-of-scope, return a fixed fallback reply
+     * - Otherwise, build prompt with history + context, call LLM once
      * - Persist turn into Redis chat memory
      */
     public RagAnswer answer(RagAnswerRequest request) {
+        // 1) Retrieve RAG results first
         RagRetrievalResult retrieval = ragRetrievalService.retrieve(toQuery(request));
-        ChatClient chatClient = resolveClient(request.resolveModel());
-
         RagAnswerRequest.ResolvedSession session = request.resolveSession();
-        var history = chatMemoryService.loadHistory(session.id());
-        String prompt = buildPrompt(request.question(), retrieval, chatMemoryService.renderHistory(history));
 
+        // 2) If beyond the KB (low score / no docs), short-circuit with fixed reply
+        if (isOutOfScope(retrieval)) {
+            chatMemoryService.appendTurn(
+                    session.id(),
+                    request.question(),
+                    OUT_OF_SCOPE_REPLY,
+                    session.temporary()
+            );
+            return new RagAnswer(OUT_OF_SCOPE_REPLY, retrieval.documents());
+        }
+
+        // 3) Otherwise, call LLM
+        ChatClient chatClient = resolveClient(request.resolveModel());
+        var history = chatMemoryService.loadHistory(session.id());
+        String prompt = buildPrompt(
+                request.question(),
+                retrieval,
+                chatMemoryService.renderHistory(history)
+        );
+
+        // Tool profile resolved for potential tool usage
         ToolProfile profile = request.resolveToolProfile(ToolProfile.BASIC_CHAT);
         List<String> toolBeanNames = toolRegistry.getFunctionBeanNamesForProfile(profile);
+        // TODO: wire toolBeanNames into ChatClient function calling if needed
 
         var response = chatClient.prompt()
-                .system("You are Mr Pot, a helpful assistant. Use the provided context and chat history to answer succinctly.")
+                .system(SYSTEM_BASE + RICH_TEXT_INSTRUCTION)
                 .user(prompt)
                 .call();
 
@@ -60,21 +96,37 @@ public class RagAnswerService {
     }
 
     /**
-     * Streaming answer (plain text, no logic chain metadata).
-     * - This is your original stream method, kept as-is for backward compatibility.
+     * Streaming answer (plain text chunks, no logic chain metadata).
+     * - If out-of-scope, stream a single fallback reply
+     * - Otherwise, stream LLM deltas and persist the full answer at the end
      */
     public Flux<String> streamAnswer(RagAnswerRequest request) {
         RagRetrievalResult retrieval = ragRetrievalService.retrieve(toQuery(request));
-        ChatClient chatClient = resolveClient(request.resolveModel());
-
         RagAnswerRequest.ResolvedSession session = request.resolveSession();
+
+        // If beyond KB, just stream the fallback reply once
+        if (isOutOfScope(retrieval)) {
+            chatMemoryService.appendTurn(
+                    session.id(),
+                    request.question(),
+                    OUT_OF_SCOPE_REPLY,
+                    session.temporary()
+            );
+            return Flux.just(OUT_OF_SCOPE_REPLY);
+        }
+
+        ChatClient chatClient = resolveClient(request.resolveModel());
         var history = chatMemoryService.loadHistory(session.id());
-        String prompt = buildPrompt(request.question(), retrieval, chatMemoryService.renderHistory(history));
+        String prompt = buildPrompt(
+                request.question(),
+                retrieval,
+                chatMemoryService.renderHistory(history)
+        );
 
         AtomicReference<StringBuilder> aggregate = new AtomicReference<>(new StringBuilder());
 
         return chatClient.prompt()
-                .system("You are Mr Pot. Answer succinctly in the user's language using the given context and history.")
+                .system(SYSTEM_BASE + RICH_TEXT_INSTRUCTION)
                 .user(prompt)
                 .stream()
                 .content()
@@ -95,11 +147,11 @@ public class RagAnswerService {
      *  - "start": request accepted, pipeline initialized
      *  - "redis": loaded previous conversation from Redis
      *  - "rag": searched knowledge base for related documents
-     *  - "answer_delta": LLM token stream
+     *  - "answer_delta": LLM token stream (or single fallback delta when out-of-scope)
      *  - "answer_final": final aggregated answer
      */
     public Flux<ThinkingEvent> streamAnswerWithLogic(RagAnswerRequest request) {
-        // --- Resolve session and client up front (cheap operations) ---
+        // Resolve session and client up front (cheap operations)
         RagAnswerRequest.ResolvedSession session = request.resolveSession();
         ChatClient chatClient = resolveClient(request.resolveModel());
 
@@ -107,58 +159,69 @@ public class RagAnswerService {
         AtomicReference<StringBuilder> aggregate =
                 new AtomicReference<>(new StringBuilder());
 
-        // --- Async Redis history load ---
-        // Run on boundedElastic to avoid blocking main threads
+        // Async Redis history load on boundedElastic
         Mono<List<RedisChatMemoryService.StoredMessage>> historyMono =
                 Mono.fromCallable(() -> chatMemoryService.loadHistory(session.id()))
                         .subscribeOn(Schedulers.boundedElastic())
-                        .cache(); // Ensure only one actual Redis call per subscription
+                        .cache();
 
-        // --- Async RAG retrieval ---
-        // Also run on boundedElastic since embedding + DB are blocking IO
+        // Async RAG retrieval on boundedElastic (embedding + DB are blocking)
         Mono<RagRetrievalResult> retrievalMono =
                 Mono.fromCallable(() -> ragRetrievalService.retrieve(toQuery(request)))
                         .subscribeOn(Schedulers.boundedElastic())
-                        .cache(); // Ensure only one actual retrieval per subscription
+                        .cache();
 
-        // --- Stage 0: "start" -> fire immediately for ultra-low first-byte latency ---
+        // Stage 0: "start"
         Flux<ThinkingEvent> startStep = Flux.just(
                 new ThinkingEvent(
                         "start",
-                        "Request received. Initializing thinking pipeline.",
+                        "Init",
                         Map.of("ts", System.currentTimeMillis())
                 )
         );
 
-        // --- Stage 1: "redis" -> emit once history is loaded ---
+        // Stage 1: "redis"
         Flux<ThinkingEvent> redisStep = historyMono.flatMapMany(history ->
                 Flux.just(
                         new ThinkingEvent(
                                 "redis",
-                                "Combined with previous conversation; some context from Redis chat history.",
+                                "History",
                                 summarizeHistory(history)
                         )
                 )
         );
 
-        // --- Stage 2: "rag" -> emit once RAG retrieval is done ---
+        // Stage 2: "rag"
         Flux<ThinkingEvent> ragStep = retrievalMono.flatMapMany(retrieval ->
                 Flux.just(
                         new ThinkingEvent(
                                 "rag",
-                                "Searching knowledge base for related content.",
+                                "Retrieval",
                                 summarizeRetrieval(retrieval)
                         )
                 )
         );
 
-        // --- Stage 3: "answer_delta" -> LLM streaming token output ---
+        // Stage 3: "answer_delta"
         Flux<ThinkingEvent> answerDeltaStep =
                 Mono.zip(historyMono, retrievalMono)
                         .flatMapMany(tuple -> {
                             var history = tuple.getT1();
                             var retrieval = tuple.getT2();
 
+                            // If beyond KB: no LLM call, emit a single fallback delta
+                            if (isOutOfScope(retrieval)) {
+                                aggregate.get().append(OUT_OF_SCOPE_REPLY);
+                                return Flux.just(
+                                        new ThinkingEvent(
+                                                "answer_delta",
+                                                "Out-of-scope",
+                                                OUT_OF_SCOPE_REPLY
+                                        )
+                                );
+                            }
+
+                            // Otherwise, call LLM
                             String historyText = chatMemoryService.renderHistory(history);
                             String prompt = buildPrompt(
                                     request.question(),
@@ -167,9 +230,7 @@ public class RagAnswerService {
                             );
 
                             return chatClient.prompt()
-                                    .system("You are Mr Pot, a helpful assistant. " +
-                                            "Answer succinctly in the user's language, " +
-                                            "using only the provided context and chat history.")
+                                    .system(SYSTEM_BASE + RICH_TEXT_INSTRUCTION)
                                     .user(prompt)
                                     .stream()
                                     .content()
@@ -178,7 +239,7 @@ public class RagAnswerService {
                                         aggregate.get().append(delta);
                                         return new ThinkingEvent(
                                                 "answer_delta",
-                                                "Generating answer.",
+                                                "Generating",
                                                 delta
                                         );
                                     });
@@ -193,12 +254,12 @@ public class RagAnswerService {
                             );
                         });
 
-        // --- Stage 4: "answer_final" -> emit the complete answer at the end ---
+        // Stage 4: "answer_final"
         Flux<ThinkingEvent> finalStep = Flux.defer(() ->
                 Flux.just(
                         new ThinkingEvent(
                                 "answer_final",
-                                "Finalized answer.",
+                                "Done",
                                 aggregate.get().toString()
                         )
                 )
@@ -222,12 +283,6 @@ public class RagAnswerService {
 
     /**
      * Resolve ChatClient bean based on requested model identifier.
-     * Supported lookup keys:
-     *  - "<model>ChatClient"
-     *  - "<model>"
-     * Fallback:
-     *  - default model "ChatClient"
-     *  - any available ChatClient if nothing matches
      */
     private ChatClient resolveClient(String model) {
         String key = Optional.ofNullable(model)
@@ -251,22 +306,21 @@ public class RagAnswerService {
 
     /**
      * Build the combined prompt:
-     *  - textual conversation history
+     *  - conversation history
      *  - retrieved KB context
      *  - user question
      */
     private String buildPrompt(String question, RagRetrievalResult retrieval, String historyText) {
         StringBuilder sb = new StringBuilder();
-        sb.append("Conversation History:\n").append(historyText).append("\n\n");
-        sb.append("Retrieved Context:\n").append(retrieval.context()).append("\n\n");
-        sb.append("User Question: ").append(question).append("\n");
-        sb.append("Answer with clear and concise. You can infer based on info.");
+        sb.append("History:\n").append(historyText).append("\n\n");
+        sb.append("Context:\n").append(retrieval.context()).append("\n\n");
+        sb.append("Q:\n").append(question).append("\n");
+        sb.append("Answer using only History and Context.");
         return sb.toString();
     }
 
     /**
      * Summarize chat history for UI / debug payload.
-     * Only keeps the last N messages to avoid huge payloads.
      */
     private List<Map<String, Object>> summarizeHistory(List<RedisChatMemoryService.StoredMessage> history) {
         if (history == null || history.isEmpty()) {
@@ -286,7 +340,6 @@ public class RagAnswerService {
 
     /**
      * Summarize retrieval result for UI / debug payload.
-     * Sends basic metadata and a short preview of each matched document.
      */
     private List<Map<String, Object>> summarizeRetrieval(RagRetrievalResult retrieval) {
         if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) {
@@ -314,5 +367,21 @@ public class RagAnswerService {
                     );
                 })
                 .toList();
+    }
+
+    /**
+     * Determine whether the retrieval result is "out of scope" for the KB.
+     */
+    private boolean isOutOfScope(RagRetrievalResult retrieval) {
+        if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) {
+            return true;
+        }
+
+        double topScore = retrieval.documents().stream()
+                .mapToDouble(ScoredDocument::score)
+                .max()
+                .orElse(0.0);
+
+        return topScore < MIN_KB_SCORE_FOR_ANSWER;
     }
 }
