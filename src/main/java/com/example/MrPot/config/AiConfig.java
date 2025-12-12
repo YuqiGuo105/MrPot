@@ -3,7 +3,9 @@ package com.example.MrPot.config;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.deepseek.DeepSeekChatModel;
 import org.springframework.ai.openai.OpenAiChatModel;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
@@ -36,5 +38,33 @@ public class AiConfig {
         return ChatClient.builder(model)
                 .defaultSystem("You're Mr Pot, Yuqi's LLM Agent")
                 .build();
+    }
+
+    /**
+     * If no ChatClient beans are registered (e.g. missing @ConditionalOnBean matches),
+     * build a default client using DeepSeek when available, otherwise fall back to OpenAI.
+     */
+    @Bean
+    @Primary
+    @ConditionalOnMissingBean(ChatClient.class)
+    public ChatClient defaultChatClient(
+            ObjectProvider<DeepSeekChatModel> deepSeekProvider,
+            ObjectProvider<OpenAiChatModel> openAiProvider
+    ) {
+        DeepSeekChatModel deepseekModel = deepSeekProvider.getIfAvailable();
+        if (deepseekModel != null) {
+            return ChatClient.builder(deepseekModel)
+                    .defaultSystem("You're Mr Pot, Yuqi's LLM Agent")
+                    .build();
+        }
+
+        OpenAiChatModel openAiModel = openAiProvider.getIfAvailable();
+        if (openAiModel != null) {
+            return ChatClient.builder(openAiModel)
+                    .defaultSystem("You're Mr Pot, Yuqi's LLM Agent")
+                    .build();
+        }
+
+        throw new IllegalStateException("No ChatModel beans are available to build a ChatClient");
     }
 }
