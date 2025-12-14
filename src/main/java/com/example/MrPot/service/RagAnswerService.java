@@ -15,6 +15,8 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -40,33 +42,38 @@ public class RagAnswerService {
     // Minimum similarity score required to consider a question "in scope" of the KB
     private static final double MIN_KB_SCORE_FOR_ANSWER = 0.15;
 
-    // If top QA doc is strong enough, we can directly output its answer without calling LLM
-    private static final double MIN_SCORE_FOR_DIRECT_QA = 0.55;
-
     // Fixed fallback reply when the question is beyond the knowledge base
     private static final String OUT_OF_SCOPE_REPLY = "I can only answer Yuqi's related stuff.";
 
+    // Prompt size controls (reduce token usage and latency)
+    private static final int MAX_HISTORY_CHARS = 2500;
+    private static final int MAX_CONTEXT_CHARS = 7000;
+
+    // Extract up to N QA candidates to guide the LLM
+    private static final int MAX_QA_CANDIDATES = 3;
+
     // Short instruction for all LLM calls
     private static final String RICH_TEXT_INSTRUCTION =
-            "Be brief. Prefer a single plain sentence. " +
+            "Keep it short (1-2 sentences). Prefer plain text. " +
+                    "You may add a light playful tone if appropriate. " +
                     "Only if structure helps, return a small HTML fragment (no <html>/<body>).";
 
     /**
-     * ✅ Softer system prompt:
+     * ✅ Softer + creative-allowed system prompt:
      * - Use History/Context as evidence
-     * - Allow small inference/paraphrase if evidence supports it
-     * - Treat Q/A blocks as authoritative
+     * - Allow paraphrase + light creative wording
+     * - Treat QA blocks as strong evidence
      * - No new facts beyond evidence
-     * - Fallback only when evidence is missing/unrelated
+     * - Fallback only when evidence missing/unrelated
      */
     private static final String SYSTEM_BASE =
             "You are Mr Pot, Yuqi's assistant. " +
                     "Use the provided History and Context as evidence. " +
-                    "You may make small, reasonable inferences and paraphrases when the evidence clearly supports it " +
-                    "(e.g., resolve pronouns, minor wording differences). " +
-                    "If Context contains a Q/A block (e.g., '【问题】...【回答】...'), treat the Answer as authoritative and reuse it " +
-                    "for semantically equivalent or closely related questions. " +
-                    "Do NOT invent new facts beyond the evidence. " +
+                    "You may paraphrase, reframe, and be slightly playful/creative in wording, " +
+                    "but you MUST NOT add new factual claims that are not supported by the evidence. " +
+                    "If Context includes Q/A blocks (e.g., '【问题】...【回答】...'), treat the Answer as strong evidence and base your reply on it " +
+                    "(you may polish or lightly rewrite). " +
+                    "If the question asks for a number but evidence only supports a status/statement, answer with the supported status/statement instead of refusing. " +
                     "If the evidence is missing or unrelated, reply exactly: \"" + OUT_OF_SCOPE_REPLY + "\". " +
                     "Reply in the user's language. ";
 
@@ -74,8 +81,7 @@ public class RagAnswerService {
      * Non-streaming RAG answer:
      * - Retrieve related documents
      * - If out-of-scope, return a fixed fallback reply
-     * - ✅ If top doc is chat_qa and score is high, directly output its answer (no LLM call)
-     * - Otherwise, call LLM once
+     * - Otherwise, build prompt with QA candidates + context + history, call LLM once
      * - Persist turn into Redis chat memory
      * - Minimal DB logging for analysis (question/prompt/answer + scored docs)
      */
@@ -99,29 +105,15 @@ public class RagAnswerService {
             return new RagAnswer(OUT_OF_SCOPE_REPLY, retrieval.documents());
         }
 
-        // ✅ Direct QA fast-path (better latency + prevents unnecessary fallback)
-        Optional<String> directQa = tryDirectQaAnswer(retrieval, Math.max(MIN_SCORE_FOR_DIRECT_QA, minScore));
-        if (directQa.isPresent()) {
-            String answer = directQa.get();
-            chatMemoryService.appendTurn(session.id(), request.question(), answer, session.temporary());
-
-            int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
-            safeLogOnce(session.id(), request.question(), model, topK, minScore,
-                    "DIRECT_QA (no LLM call)", answer, latencyMs, false, null, retrieval);
-
-            return new RagAnswer(answer, retrieval.documents());
-        }
-
         ChatClient chatClient = resolveClient(model);
         var history = chatMemoryService.loadHistory(session.id());
-        String historyText = chatMemoryService.renderHistory(history);
-
-        String prompt = buildPrompt(request.question(), retrieval, historyText);
+        String historyText = truncate(chatMemoryService.renderHistory(history), MAX_HISTORY_CHARS);
 
         // Tool profile resolved for potential tool usage (kept for future function-calling)
         ToolProfile profile = request.resolveToolProfile(ToolProfile.BASIC_CHAT);
         toolRegistry.getFunctionBeanNamesForProfile(profile);
 
+        String prompt = buildPrompt(request.question(), retrieval, historyText);
         String systemPrompt = SYSTEM_BASE + RICH_TEXT_INSTRUCTION;
 
         String answer;
@@ -153,7 +145,6 @@ public class RagAnswerService {
     /**
      * Streaming answer (plain text chunks, no logic chain metadata).
      * - If out-of-scope, stream a single fallback reply
-     * - ✅ If direct QA is available, stream that once (no LLM call)
      * - Otherwise, stream LLM deltas and persist the full answer at the end
      * - Minimal DB logging for analysis at stream end (best-effort)
      */
@@ -177,28 +168,15 @@ public class RagAnswerService {
             return Flux.just(OUT_OF_SCOPE_REPLY);
         }
 
-        // ✅ Direct QA fast-path in streaming mode
-        Optional<String> directQa = tryDirectQaAnswer(retrieval, Math.max(MIN_SCORE_FOR_DIRECT_QA, minScore));
-        if (directQa.isPresent()) {
-            String answer = directQa.get();
-            chatMemoryService.appendTurn(session.id(), request.question(), answer, session.temporary());
-
-            int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
-            safeLogOnce(session.id(), request.question(), model, topK, minScore,
-                    "DIRECT_QA (no LLM call)", answer, latencyMs, false, null, retrieval);
-
-            return Flux.just(answer);
-        }
-
         ChatClient chatClient = resolveClient(model);
         var history = chatMemoryService.loadHistory(session.id());
-        String historyText = chatMemoryService.renderHistory(history);
+        String historyText = truncate(chatMemoryService.renderHistory(history), MAX_HISTORY_CHARS);
+
         String prompt = buildPrompt(request.question(), retrieval, historyText);
+        String systemPrompt = SYSTEM_BASE + RICH_TEXT_INSTRUCTION;
 
         AtomicReference<StringBuilder> aggregate = new AtomicReference<>(new StringBuilder());
         AtomicReference<String> errorRef = new AtomicReference<>(null);
-
-        String systemPrompt = SYSTEM_BASE + RICH_TEXT_INSTRUCTION;
 
         return chatClient.prompt()
                 .system(systemPrompt)
@@ -222,7 +200,7 @@ public class RagAnswerService {
     }
 
     /**
-     * Streaming answer WITH logic chain metadata, optimized for lower latency.
+     * Streaming answer WITH logic chain metadata.
      *
      * Stages:
      *  - "start"
@@ -274,6 +252,7 @@ public class RagAnswerService {
                         .flatMapMany(tuple -> {
                             var history = tuple.getT1();
                             var retrieval = tuple.getT2();
+
                             retrievalRef.set(retrieval);
 
                             if (isOutOfScope(retrieval)) {
@@ -288,24 +267,9 @@ public class RagAnswerService {
                                 ));
                             }
 
-                            // ✅ Direct QA fast-path: emit one delta and skip LLM stream
-                            Optional<String> directQa = tryDirectQaAnswer(retrieval, Math.max(MIN_SCORE_FOR_DIRECT_QA, minScore));
-                            if (directQa.isPresent()) {
-                                outOfScopeRef.set(false);
-                                promptRef.set("DIRECT_QA (no LLM call)");
-                                String ans = directQa.get();
-                                aggregate.get().append(ans);
-
-                                return Flux.just(new ThinkingEvent(
-                                        "answer_delta",
-                                        "Direct QA",
-                                        ans
-                                ));
-                            }
-
                             outOfScopeRef.set(false);
 
-                            String historyText = chatMemoryService.renderHistory(history);
+                            String historyText = truncate(chatMemoryService.renderHistory(history), MAX_HISTORY_CHARS);
                             String prompt = buildPrompt(request.question(), retrieval, historyText);
                             promptRef.set(prompt);
 
@@ -385,17 +349,38 @@ public class RagAnswerService {
     }
 
     /**
-     * ✅ Prompt now encourages "supported inference" + reusing QA answers.
+     * ✅ Prompt includes QA candidates as "strong evidence" and asks the LLM to polish them.
      */
     private String buildPrompt(String question, RagRetrievalResult retrieval, String historyText) {
+        String contextText = truncate(Optional.ofNullable(retrieval.context()).orElse(""), MAX_CONTEXT_CHARS);
+
+        List<QaCandidate> qaCandidates = extractQaCandidates(retrieval);
+
         StringBuilder sb = new StringBuilder();
-        sb.append("Context:\n").append(retrieval.context()).append("\n\n");
+
+        if (!qaCandidates.isEmpty()) {
+            sb.append("QA Candidates (strong evidence extracted from KB):\n");
+            for (int i = 0; i < qaCandidates.size(); i++) {
+                QaCandidate c = qaCandidates.get(i);
+                sb.append("- ")
+                        .append("#").append(i + 1)
+                        .append(" (score=").append(round3(c.score)).append(", id=").append(c.id).append(", type=").append(c.type).append(")\n")
+                        .append("  Answer: ").append(c.answer).append("\n");
+            }
+            sb.append("\n");
+            sb.append("Guidance:\n");
+            sb.append("- If a QA Candidate clearly matches the question, base your reply on its Answer.\n");
+            sb.append("- You may polish/rewrite and be slightly playful, but do not add new facts.\n");
+            sb.append("- If question asks for a count but evidence supports only a status/statement, answer with the supported status/statement.\n\n");
+        }
+
+        sb.append("Context:\n").append(contextText).append("\n\n");
         sb.append("History:\n").append(historyText).append("\n\n");
         sb.append("Question:\n").append(question).append("\n\n");
-        sb.append("Rules:\n");
-        sb.append("- Use Context/History as evidence. You may infer if evidence clearly supports it.\n");
-        sb.append("- If Context contains a Q/A block, you can output the Q/A Answer directly (or minimal paraphrase).\n");
+        sb.append("Output rules:\n");
+        sb.append("- Use evidence above. No new factual claims.\n");
         sb.append("- If evidence is missing/unrelated, reply exactly: ").append(OUT_OF_SCOPE_REPLY).append("\n");
+
         return sb.toString();
     }
 
@@ -404,7 +389,7 @@ public class RagAnswerService {
             return List.of();
         }
 
-        int maxMessages = 6;
+        int maxMessages = 6; // last 3 turns (user+assistant)
         int startIdx = Math.max(0, history.size() - maxMessages);
 
         return history.subList(startIdx, history.size()).stream()
@@ -457,53 +442,51 @@ public class RagAnswerService {
     }
 
     /**
-     * ✅ Directly answer from a strong chat_qa document.
-     * This prevents the LLM from refusing when the QA answer is present but not "numeric/direct".
+     * Extract QA candidates from retrieved documents (top by score).
+     * We DON'T return them directly; we feed them to the LLM for polishing.
      */
-    private Optional<String> tryDirectQaAnswer(RagRetrievalResult retrieval, double minScoreForDirect) {
+    private List<QaCandidate> extractQaCandidates(RagRetrievalResult retrieval) {
         if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) {
-            return Optional.empty();
+            return List.of();
         }
 
-        ScoredDocument best = retrieval.documents().stream()
-                .max((a, b) -> Double.compare(a.score(), b.score()))
-                .orElse(null);
+        List<ScoredDocument> sorted = retrieval.documents().stream()
+                .sorted(Comparator.comparingDouble(ScoredDocument::score).reversed())
+                .toList();
 
-        if (best == null || best.document() == null) {
-            return Optional.empty();
+        List<QaCandidate> out = new ArrayList<>();
+        for (ScoredDocument sd : sorted) {
+            if (sd == null || sd.document() == null) {
+                continue;
+            }
+
+            var doc = sd.document();
+            String type = Optional.ofNullable(doc.getDocType()).orElse("");
+            String content = Optional.ofNullable(doc.getContent()).orElse("");
+
+            boolean looksQa = "chat_qa".equalsIgnoreCase(type) || content.contains("【回答】") || content.toLowerCase().contains("answer:");
+            if (!looksQa) {
+                continue;
+            }
+
+            Optional<String> ans = extractQaAnswer(content);
+            if (ans.isEmpty()) {
+                continue;
+            }
+
+            out.add(new QaCandidate(
+                    String.valueOf(doc.getId()),
+                    type,
+                    sd.score(),
+                    truncate(ans.get().trim(), 400)
+            ));
+
+            if (out.size() >= MAX_QA_CANDIDATES) {
+                break;
+            }
         }
 
-        if (best.score() < minScoreForDirect) {
-            return Optional.empty();
-        }
-
-        String docType = best.document().getDocType();
-        String content = best.document().getContent();
-
-        // Only do this for QA-like docs (or when markers exist)
-        boolean looksQa = (docType != null && docType.equalsIgnoreCase("chat_qa"))
-                || (content != null && content.contains("【回答】"));
-
-        if (!looksQa || content == null || content.isBlank()) {
-            return Optional.empty();
-        }
-
-        Optional<String> extracted = extractQaAnswer(content);
-        if (extracted.isEmpty()) {
-            return Optional.empty();
-        }
-
-        String ans = extracted.get().trim();
-        if (ans.isBlank()) {
-            return Optional.empty();
-        }
-
-        // Keep it short to avoid leaking huge blobs
-        if (ans.length() > 400) {
-            ans = ans.substring(0, 400) + "...";
-        }
-
-        return Optional.of(ans);
+        return out;
     }
 
     /**
@@ -516,7 +499,7 @@ public class RagAnswerService {
             return Optional.empty();
         }
 
-        // Chinese marker
+        // Chinese marker: 【回答】 ... (until next 【...】 or end)
         Pattern zh = Pattern.compile("【回答】\\s*([\\s\\S]*?)(?:\\n\\s*【|\\z)");
         Matcher m1 = zh.matcher(content);
         if (m1.find()) {
@@ -526,7 +509,7 @@ public class RagAnswerService {
             }
         }
 
-        // English marker
+        // English marker: Answer: ... / A: ...
         Pattern en = Pattern.compile("(?i)(?:^|\\n)\\s*(?:answer\\s*:|a\\s*: )\\s*([\\s\\S]*?)(?:\\n\\s*(?:question\\s*:|q\\s*:|context\\s*:)|\\z)");
         Matcher m2 = en.matcher(content);
         if (m2.find()) {
@@ -538,6 +521,22 @@ public class RagAnswerService {
 
         return Optional.empty();
     }
+
+    private String truncate(String s, int maxChars) {
+        if (s == null) {
+            return "";
+        }
+        if (s.length() <= maxChars) {
+            return s;
+        }
+        return s.substring(0, maxChars) + "...";
+    }
+
+    private static double round3(double v) {
+        return Math.round(v * 1000.0) / 1000.0;
+    }
+
+    private record QaCandidate(String id, String type, double score, String answer) {}
 
     private void safeLogOnce(
             String sessionId,
