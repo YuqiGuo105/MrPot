@@ -8,6 +8,8 @@ import com.example.MrPot.model.ScoredDocument;
 import com.example.MrPot.model.ThinkingEvent;
 import com.example.MrPot.tools.ToolProfile;
 import com.example.MrPot.tools.ToolRegistry;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
@@ -52,39 +54,33 @@ public class RagAnswerService {
     // Extract up to N QA candidates to guide the LLM
     private static final int MAX_QA_CANDIDATES = 3;
 
-    // Short instruction for all LLM calls
-    private static final String RICH_TEXT_INSTRUCTION =
-            "Keep it short (1-2 sentences). Prefer plain text. " +
-                    "You may add a light playful tone if appropriate. " +
-                    "Only if structure helps, return a small HTML fragment (no <html>/<body>).";
+    // Keep only a few latest log rows in prompt (token saver)
+    private static final int MAX_LOG_ROWS_IN_PROMPT = 8;
+
+    private static final ObjectMapper OM = new ObjectMapper();
+
+    // Keep style minimal to reduce tokens
+    private static final String RESPONSE_STYLE =
+            "Be concise. Plain text. Bullets only if helpful. Raw https:// links only.";
 
     /**
-     * ✅ Softer + creative-allowed system prompt:
-     * - Use History/Context as evidence
-     * - Allow paraphrase + light creative wording
-     * - Treat QA blocks as strong evidence
-     * - No new facts beyond evidence
-     * - Fallback only when evidence missing/unrelated
+     * Low-token, accuracy-first system prompt:
+     * - Evidence grounded for Yuqi-specific/private facts
+     * - Allow friendly human-like tone
+     * - Allow normal answers for general how-to/coding/capability questions
+     * - Treat Q/A blocks as strong evidence
+     * - Strict fallback string when needed
      */
     private static final String SYSTEM_BASE =
             "You are Mr Pot, Yuqi's assistant. " +
-                    "Use the provided History and Context as evidence. " +
-                    "You may paraphrase, reframe, and be slightly playful/creative in wording, " +
-                    "but you MUST NOT add new factual claims that are not supported by the evidence. " +
-                    "If Context includes Q/A blocks (e.g., '【问题】...【回答】...'), treat the Answer as strong evidence and base your reply on it " +
-                    "(you may polish or lightly rewrite). " +
-                    "If the question asks for a number but evidence only supports a status/statement, answer with the supported status/statement instead of refusing. " +
-                    "If the evidence is missing or unrelated, reply exactly: \"" + OUT_OF_SCOPE_REPLY + "\". " +
+                    "Use History/Context as evidence; do not add unsupported facts. " +
+                    "You may sound friendly, slightly playful, and human-like. " +
+                    "If Context has Q/A blocks (【问题】/【回答】), treat the Answer as strong evidence; you may polish. " +
+                    "If asked for a number but evidence only supports a status/statement, answer that supported status/statement. " +
+                    "For general how-to/coding/capability questions: answer normally. " +
+                    "If Yuqi-specific/private facts lack evidence, reply exactly: \"" + OUT_OF_SCOPE_REPLY + "\". " +
                     "Reply in the user's language. ";
 
-    /**
-     * Non-streaming RAG answer:
-     * - Retrieve related documents
-     * - If out-of-scope, return a fixed fallback reply
-     * - Otherwise, build prompt with QA candidates + context + history, call LLM once
-     * - Persist turn into Redis chat memory
-     * - Minimal DB logging for analysis (question/prompt/answer + scored docs)
-     */
     public RagAnswer answer(RagAnswerRequest request) {
         long t0 = System.nanoTime();
 
@@ -99,22 +95,26 @@ public class RagAnswerService {
             chatMemoryService.appendTurn(session.id(), request.question(), OUT_OF_SCOPE_REPLY, session.temporary());
 
             int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
-            safeLogOnce(session.id(), request.question(), model, topK, minScore,
-                    "OUT_OF_SCOPE (no LLM call)", OUT_OF_SCOPE_REPLY, latencyMs, true, null, retrieval);
+            safeLogOnce(
+                    session.id(), request.question(), model, topK, minScore,
+                    "OUT_OF_SCOPE (no LLM call)", OUT_OF_SCOPE_REPLY, latencyMs,
+                    true, null, retrieval
+            );
 
             return new RagAnswer(OUT_OF_SCOPE_REPLY, retrieval.documents());
         }
 
         ChatClient chatClient = resolveClient(model);
+
         var history = chatMemoryService.loadHistory(session.id());
         String historyText = truncate(chatMemoryService.renderHistory(history), MAX_HISTORY_CHARS);
 
-        // Tool profile resolved for potential tool usage (kept for future function-calling)
+        // Resolve tool profile for future function-calling (kept)
         ToolProfile profile = request.resolveToolProfile(ToolProfile.BASIC_CHAT);
         toolRegistry.getFunctionBeanNamesForProfile(profile);
 
         String prompt = buildPrompt(request.question(), retrieval, historyText);
-        String systemPrompt = SYSTEM_BASE + RICH_TEXT_INSTRUCTION;
+        String systemPrompt = SYSTEM_BASE + RESPONSE_STYLE;
 
         String answer;
         String error = null;
@@ -142,12 +142,6 @@ public class RagAnswerService {
         return new RagAnswer(answer, retrieval.documents());
     }
 
-    /**
-     * Streaming answer (plain text chunks, no logic chain metadata).
-     * - If out-of-scope, stream a single fallback reply
-     * - Otherwise, stream LLM deltas and persist the full answer at the end
-     * - Minimal DB logging for analysis at stream end (best-effort)
-     */
     public Flux<String> streamAnswer(RagAnswerRequest request) {
         long t0 = System.nanoTime();
 
@@ -169,11 +163,12 @@ public class RagAnswerService {
         }
 
         ChatClient chatClient = resolveClient(model);
+
         var history = chatMemoryService.loadHistory(session.id());
         String historyText = truncate(chatMemoryService.renderHistory(history), MAX_HISTORY_CHARS);
 
         String prompt = buildPrompt(request.question(), retrieval, historyText);
-        String systemPrompt = SYSTEM_BASE + RICH_TEXT_INSTRUCTION;
+        String systemPrompt = SYSTEM_BASE + RESPONSE_STYLE;
 
         AtomicReference<StringBuilder> aggregate = new AtomicReference<>(new StringBuilder());
         AtomicReference<String> errorRef = new AtomicReference<>(null);
@@ -199,16 +194,6 @@ public class RagAnswerService {
                 });
     }
 
-    /**
-     * Streaming answer WITH logic chain metadata.
-     *
-     * Stages:
-     *  - "start"
-     *  - "redis"
-     *  - "rag"
-     *  - "answer_delta"
-     *  - "answer_final"
-     */
     public Flux<ThinkingEvent> streamAnswerWithLogic(RagAnswerRequest request) {
         long t0 = System.nanoTime();
 
@@ -273,7 +258,7 @@ public class RagAnswerService {
                             String prompt = buildPrompt(request.question(), retrieval, historyText);
                             promptRef.set(prompt);
 
-                            String systemPrompt = SYSTEM_BASE + RICH_TEXT_INSTRUCTION;
+                            String systemPrompt = SYSTEM_BASE + RESPONSE_STYLE;
 
                             return chatClient.prompt()
                                     .system(systemPrompt)
@@ -348,40 +333,89 @@ public class RagAnswerService {
                 .orElseThrow(() -> new IllegalStateException("No ChatClient beans are available"));
     }
 
-    /**
-     * ✅ Prompt includes QA candidates as "strong evidence" and asks the LLM to polish them.
-     */
     private String buildPrompt(String question, RagRetrievalResult retrieval, String historyText) {
-        String contextText = truncate(Optional.ofNullable(retrieval.context()).orElse(""), MAX_CONTEXT_CHARS);
+        String rawContext = Optional.ofNullable(retrieval.context()).orElse("");
+        String contextText = compactLogContext(rawContext, MAX_CONTEXT_CHARS);
 
         List<QaCandidate> qaCandidates = extractQaCandidates(retrieval);
 
         StringBuilder sb = new StringBuilder();
 
+        // Keep QA hints short (token saver)
         if (!qaCandidates.isEmpty()) {
-            sb.append("QA Candidates (strong evidence extracted from KB):\n");
+            sb.append("QA Hints:\n");
             for (int i = 0; i < qaCandidates.size(); i++) {
                 QaCandidate c = qaCandidates.get(i);
-                sb.append("- ")
-                        .append("#").append(i + 1)
-                        .append(" (score=").append(round3(c.score)).append(", id=").append(c.id).append(", type=").append(c.type).append(")\n")
-                        .append("  Answer: ").append(c.answer).append("\n");
+                sb.append("- #").append(i + 1)
+                        .append(" (score=").append(round3(c.score))
+                        .append(", id=").append(c.id)
+                        .append(", type=").append(c.type)
+                        .append(") ")
+                        .append(truncate(c.answer, 260))
+                        .append("\n");
             }
             sb.append("\n");
-            sb.append("Guidance:\n");
-            sb.append("- If a QA Candidate clearly matches the question, base your reply on its Answer.\n");
-            sb.append("- You may polish/rewrite and be slightly playful, but do not add new facts.\n");
-            sb.append("- If question asks for a count but evidence supports only a status/statement, answer with the supported status/statement.\n\n");
         }
 
         sb.append("Context:\n").append(contextText).append("\n\n");
         sb.append("History:\n").append(historyText).append("\n\n");
-        sb.append("Question:\n").append(question).append("\n\n");
-        sb.append("Output rules:\n");
-        sb.append("- Use evidence above. No new factual claims.\n");
-        sb.append("- If evidence is missing/unrelated, reply exactly: ").append(OUT_OF_SCOPE_REPLY).append("\n");
+        sb.append("Q:\n").append(question).append("\n");
 
         return sb.toString();
+    }
+
+    // Compress log-like structured context into a few rows to reduce tokens
+    private String compactLogContext(String raw, int maxChars) {
+        if (raw == null || raw.isBlank()) return "";
+
+        String s = raw.trim();
+        if (!(s.startsWith("[") || s.startsWith("{"))) {
+            return truncate(s, maxChars);
+        }
+
+        try {
+            JsonNode root = OM.readTree(s);
+
+            List<JsonNode> rows = new ArrayList<>();
+            if (root.isArray()) root.forEach(rows::add);
+            else if (root.isObject()) rows.add(root);
+            else return truncate(s, maxChars);
+
+            record Row(String id, long createdAt, String q, String a) {}
+
+            List<Row> out = new ArrayList<>();
+            for (JsonNode n : rows) {
+                if (!n.isObject()) continue;
+
+                String q = n.path("question").asText("");
+                String a = n.path("answer").asText("");
+                if (a != null && a.trim().equals(OUT_OF_SCOPE_REPLY)) continue; // ignore stored fallback
+
+                long t = n.path("createdAt").asLong(0L);
+                String id = n.path("id").asText("");
+
+                if ((q == null || q.isBlank()) && (a == null || a.isBlank())) continue;
+                out.add(new Row(id, t, q, a));
+            }
+
+            // Newest first
+            out.sort((x, y) -> Long.compare(y.createdAt, x.createdAt));
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("Log rows:\n");
+            int limit = Math.min(MAX_LOG_ROWS_IN_PROMPT, out.size());
+            for (int i = 0; i < limit; i++) {
+                Row r = out.get(i);
+                sb.append("- (id=").append(r.id()).append(", t=").append(r.createdAt()).append(") ")
+                        .append("Q: ").append(truncate(r.q(), 160)).append(" ")
+                        .append("A: ").append(truncate(r.a(), 220))
+                        .append("\n");
+            }
+
+            return truncate(sb.toString(), maxChars);
+        } catch (Exception ignore) {
+            return truncate(s, maxChars);
+        }
     }
 
     private List<Map<String, Object>> summarizeHistory(List<RedisChatMemoryService.StoredMessage> history) {
@@ -441,10 +475,6 @@ public class RagAnswerService {
         return topScore < MIN_KB_SCORE_FOR_ANSWER;
     }
 
-    /**
-     * Extract QA candidates from retrieved documents (top by score).
-     * We DON'T return them directly; we feed them to the LLM for polishing.
-     */
     private List<QaCandidate> extractQaCandidates(RagRetrievalResult retrieval) {
         if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) {
             return List.of();
@@ -464,7 +494,11 @@ public class RagAnswerService {
             String type = Optional.ofNullable(doc.getDocType()).orElse("");
             String content = Optional.ofNullable(doc.getContent()).orElse("");
 
-            boolean looksQa = "chat_qa".equalsIgnoreCase(type) || content.contains("【回答】") || content.toLowerCase().contains("answer:");
+            boolean looksQa =
+                    "chat_qa".equalsIgnoreCase(type)
+                            || content.contains("【回答】")
+                            || content.toLowerCase().contains("answer:");
+
             if (!looksQa) {
                 continue;
             }
@@ -474,11 +508,16 @@ public class RagAnswerService {
                 continue;
             }
 
+            String a = ans.get().trim();
+            if (a.equals(OUT_OF_SCOPE_REPLY)) {
+                continue; // do not treat fallback as evidence
+            }
+
             out.add(new QaCandidate(
                     String.valueOf(doc.getId()),
                     type,
                     sd.score(),
-                    truncate(ans.get().trim(), 400)
+                    truncate(a, 400)
             ));
 
             if (out.size() >= MAX_QA_CANDIDATES) {
@@ -489,11 +528,6 @@ public class RagAnswerService {
         return out;
     }
 
-    /**
-     * Extract answer from common QA formats:
-     * - Chinese: 【回答】 ... (until next 【...】 or end)
-     * - English: Answer: ... / A: ...
-     */
     private Optional<String> extractQaAnswer(String content) {
         if (content == null) {
             return Optional.empty();
