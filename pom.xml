@@ -23,6 +23,7 @@
         <spring-ai.version>1.1.2</spring-ai.version>
         <!-- add explicit Lombok version -->
         <lombok.version>1.18.36</lombok.version>
+        <dashscope.version>2.19.0</dashscope.version>
     </properties>
 
     <dependencies>
@@ -39,6 +40,13 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webflux</artifactId>
+        </dependency>
+
+        <!-- Qwen (DashScope) client; used for Qwen3-VL-Flash integrations -->
+        <dependency>
+            <groupId>com.alibaba.dashscope</groupId>
+            <artifactId>dashscope-sdk-java</artifactId>
+            <version>${dashscope.version}</version>
         </dependency>
 
         <dependency>
