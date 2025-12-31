@@ -82,13 +82,13 @@ public class RagAnswerService {
 
     /**
      * Revised:
-     * 1) More creative + humor allowed (still grounded, not mean)
-     * 2) General how-to/coding: answer normally
-     * 3) No-evidence: refuse in user's language (same meaning as OUT_OF_SCOPE_REPLY), not hard-coded
+     * - More creative + humor allowed (still grounded)
+     * - General how-to/coding: answer normally
+     * - No relevant evidence: refuse in user's language with same meaning as OUT_OF_SCOPE_REPLY (no hard-coded locale)
      */
     private static final String SYSTEM_PROMPT =
             "You are Mr Pot (Yuqi's assistant). Reply in the user's language. " +
-                    "Tone: warm, witty, a little humorous when appropriate (no sarcasm/insults; no made-up facts). " +
+                    "Tone: warm, witty, a little humorous when appropriate (no insults; no made-up facts). " +
                     "Yuqi-specific/private facts: use only evidence from CTX/FILE/HIS; never invent. " +
                     "QA References are hints only: use only if they clearly match the user's question and do not conflict with CTX/FILE/HIS; never copy blindly. " +
                     "If evidence is partial, answer what is supported and say what is not mentioned/unknown. " +
@@ -154,13 +154,12 @@ public class RagAnswerService {
         toolRegistry.getFunctionBeanNamesForProfile(profile);
 
         String prompt = buildPrompt(request.question(), retrieval, historyText, fileText, noEvidence, outOfScopeKb);
-        String systemPrompt = SYSTEM_PROMPT;
 
         String answer;
         String error = null;
         try {
             var response = chatClient.prompt()
-                    .system(systemPrompt)
+                    .system(SYSTEM_PROMPT)
                     .user(prompt)
                     .call();
             answer = response.content();
@@ -190,7 +189,6 @@ public class RagAnswerService {
         double minScore = request.resolveMinScore(DEFAULT_MIN_SCORE);
         String model = request.resolveModel();
 
-        // Do NOT block event-loop. Prepare everything reactively.
         return prepareContextReactive(request, topK, minScore)
                 .flatMapMany(ctx -> {
                     ChatClient chatClient = resolveClient(model);
@@ -303,17 +301,16 @@ public class RagAnswerService {
                 new ThinkingEvent("start", "Init", Map.of("ts", System.currentTimeMillis()))
         );
 
-        // Progress: emit URL list immediately (so frontend can show "fetching...")
+        // Emit URL list BEFORE subscribing to attachMono (frontend progress)
         Flux<ThinkingEvent> fileFetchStartStep = Flux.defer(() -> {
             if (urls.isEmpty()) return Flux.empty();
             return Flux.just(new ThinkingEvent(
                     "file_fetch_start",
-                    "Fetching",
+                    "Fetching files",
                     Map.of("count", urls.size(), "urls", urls)
             ));
         });
 
-        // file_fetch/file_extract happen BEFORE redis/rag/answer (order is enforced by concat below)
         Flux<ThinkingEvent> fileFetchStep = attachMono.flatMapMany(ctx -> {
             if (urls.isEmpty()) return Flux.empty();
             List<ExtractedFile> fs = (ctx == null) ? List.of() : safeList(ctx.files());
@@ -326,7 +323,7 @@ public class RagAnswerService {
             List<ExtractedFile> fs = (ctx == null) ? List.of() : safeList(ctx.files());
             if (fs.isEmpty()) return Flux.just(new ThinkingEvent("file_extract", "Extracted", Map.of("count", 0)));
 
-            // Emit keywords + a small relevant excerpt for frontend progress display
+            // Emit keywords + small relevant excerpt for frontend progress display
             List<String> kws = extractFileKeywords(fs, PROGRESS_KEYWORDS);
             String excerpts = truncate(buildFileContext(request.question(), fs), PROGRESS_EXCERPT_CHARS);
 
@@ -335,7 +332,7 @@ public class RagAnswerService {
             payload.put("keywords", kws);
             payload.put("excerpts", excerpts);
 
-            return Flux.just(new ThinkingEvent("file_extract", "Extracted", payload));
+            return Flux.just(new ThinkingEvent("file_extract", "Extracted files' content", payload));
         });
 
         Flux<ThinkingEvent> redisStep = historyMono.flatMapMany(history ->
@@ -406,6 +403,7 @@ public class RagAnswerService {
                 Flux.just(new ThinkingEvent("answer_final", "Done", aggregate.get().toString()))
         );
 
+        // Order guaranteed: urls -> fetch -> extract -> redis/rag -> answer
         return Flux.concat(
                 startStep,
                 fileFetchStartStep,
@@ -509,48 +507,131 @@ public class RagAnswerService {
         return q + "\nFile keywords: " + joined;
     }
 
+    /**
+     * Language-agnostic keyword extraction:
+     * - Unicode tokens: letters/digits across any language/script
+     * - If tokenization yields too few tokens (typical for no-space scripts), add char-bigrams from long runs
+     * - No script-specific hard-coding
+     */
     private static List<String> extractFileKeywords(List<ExtractedFile> files, int maxK) {
         if (files == null || files.isEmpty() || maxK <= 0) return List.of();
 
-        LinkedHashSet<String> out = new LinkedHashSet<>();
+        // Any letters/digits (all scripts). No language/script hard-coding.
+        final Pattern TOKEN = Pattern.compile("[\\p{L}\\p{N}]{2,}");
+
+        Map<String, Integer> freq = new HashMap<>();
+        int totalTokenCount = 0;
+
         for (ExtractedFile f : files) {
             if (f == null) continue;
             if (f.error() != null && !f.error().isBlank()) continue;
 
-            String name = f.filename();
-            if (name != null && name.length() >= 4) out.add(name);
+            // 1) Filename tokens (boosted)
+            String filename = Optional.ofNullable(f.filename()).orElse("");
+            if (!filename.isBlank()) {
+                for (String part : filename.split("[^\\p{L}\\p{N}]+")) {
+                    String kw = normalizeKeyword(part);
+                    if (!isNoiseToken(kw)) bump(freq, kw, 3);
+                }
+            }
 
+            // 2) Text tokens (budgeted)
             String text = Optional.ofNullable(f.extractedText()).orElse("");
             if (text.isBlank()) continue;
 
             String scan = text.length() > 5000 ? text.substring(0, 5000) : text;
 
-            String[] parts = scan.toLowerCase(Locale.ROOT).split("[^\\p{IsAlphabetic}\\p{IsDigit}]+");
-            for (String p : parts) {
-                if (p == null) continue;
-                if (p.length() >= 4 && !isStopword(p)) out.add(p);
-                if (out.size() >= maxK) return out.stream().limit(maxK).toList();
+            Matcher m = TOKEN.matcher(scan);
+            while (m.find()) {
+                totalTokenCount++;
+                String kw = normalizeKeyword(m.group());
+                if (isNoiseToken(kw)) continue;
+                bump(freq, kw, 1);
             }
 
-            Matcher m = Pattern.compile("[\\p{IsHan}]{2,}").matcher(scan);
-            while (m.find()) {
-                String w = m.group();
-                if (w != null && w.length() >= 2) out.add(w);
-                if (out.size() >= maxK) return out.stream().limit(maxK).toList();
+            // 3) N-gram fallback (only when tokenization is sparse → often no-space writing)
+            // Heuristic is language-agnostic: if we got very few tokens, we add bigrams from long runs.
+            if (totalTokenCount < 20) {
+                // Re-scan and only bigram "long" matches to avoid noise on typical space-separated languages.
+                Matcher m2 = TOKEN.matcher(scan);
+                int ngramBudget = 600; // guardrail
+                while (m2.find() && ngramBudget > 0) {
+                    String run = m2.group();
+                    if (run == null) continue;
+                    run = run.trim();
+                    if (run.length() < 8) continue; // only long runs (common in no-space text)
+                    if (run.length() > 80) run = run.substring(0, 80); // clamp
+
+                    String normRun = normalizeKeyword(run);
+                    if (!isNoiseToken(normRun) && normRun.length() <= 16) {
+                        bump(freq, normRun, 1); // keep short-ish run as a whole too
+                    }
+
+                    for (int i = 0; i + 2 <= normRun.length() && ngramBudget > 0; i++) {
+                        String bg = normRun.substring(i, i + 2);
+                        if (!isNoiseToken(bg)) bump(freq, bg, 1);
+                        ngramBudget--;
+                    }
+                }
             }
         }
 
-        return out.stream().limit(maxK).toList();
+        if (freq.isEmpty()) return List.of();
+
+        return freq.entrySet().stream()
+                .sorted((a, b) -> {
+                    int c = Integer.compare(b.getValue(), a.getValue());
+                    if (c != 0) return c;
+                    c = Integer.compare(b.getKey().length(), a.getKey().length());
+                    if (c != 0) return c;
+                    return a.getKey().compareTo(b.getKey());
+                })
+                .map(Map.Entry::getKey)
+                .limit(maxK)
+                .toList();
     }
 
-    private static boolean isStopword(String w) {
+    private static void bump(Map<String, Integer> freq, String kw, int delta) {
+        if (kw == null || kw.isBlank()) return;
+        freq.merge(kw, delta, Integer::sum);
+    }
+
+    private static String normalizeKeyword(String s) {
+        if (s == null) return "";
+        String t = s.trim();
+        if (t.isEmpty()) return "";
+        return t.toLowerCase(Locale.ROOT);
+    }
+
+    /**
+     * Generic noise filter (NOT language-specific stopwords).
+     * Conservative: removes obvious boilerplate only.
+     */
+    private static boolean isNoiseToken(String w) {
         if (w == null) return true;
-        String s = w.toLowerCase(Locale.ROOT);
+        String s = w.trim();
+        if (s.isEmpty()) return true;
+
+        if (s.length() < 2) return true;
+        if (s.length() > 40) return true;
+
+        boolean allDigits = true;
+        for (int i = 0; i < s.length(); i++) {
+            if (!Character.isDigit(s.charAt(i))) {
+                allDigits = false;
+                break;
+            }
+        }
+        if (allDigits) return true;
+
+        String lower = s.toLowerCase(Locale.ROOT);
         return Set.of(
-                "the","and","with","from","this","that","have","will","your",
-                "http","https","www","com","org","net","file","files","image","pdf",
-                "page","pages","chapter","section","figure","table"
-        ).contains(s);
+                "http", "https", "www",
+                "com", "org", "net",
+                "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx",
+                "png", "jpg", "jpeg", "webp",
+                "file", "files", "image", "images"
+        ).contains(lower);
     }
 
     private static <T> List<T> safeList(List<T> list) {
@@ -568,7 +649,7 @@ public class RagAnswerService {
     }
 
     // --------------------------
-    // Existing helpers (prompt + file context)
+    // Prompt + file context
     // --------------------------
 
     private ChatClient resolveClient(String model) {
@@ -602,7 +683,6 @@ public class RagAnswerService {
 
         StringBuilder sb = new StringBuilder();
 
-        // Small meta hint (helps avoid wrong answers)
         sb.append("Meta: noEvidence=").append(noEvidence)
                 .append(", kbWeak=").append(outOfScopeKb)
                 .append("\n\n");
@@ -641,13 +721,6 @@ public class RagAnswerService {
         return "LOW";
     }
 
-    /**
-     * Convert extracted file texts into a small, relevant prompt section.
-     * - chunk the text
-     * - score chunks by keyword overlap with question
-     * - pick top chunks
-     * - clamp to MAX_FILE_CONTEXT_CHARS
-     */
     private String buildFileContext(String question, List<ExtractedFile> files) {
         if (files == null || files.isEmpty()) return "";
 
@@ -781,7 +854,6 @@ public class RagAnswerService {
         )).toList();
     }
 
-    // Compress log-like structured context into a few rows to reduce tokens
     private String compactLogContext(String raw, int maxChars) {
         if (raw == null || raw.isBlank()) return "";
 
@@ -804,7 +876,6 @@ public class RagAnswerService {
             for (JsonNode n : rows) {
                 if (!n.isObject()) continue;
 
-                // Prefer structured flag so localized refusals won't pollute prompt
                 boolean oos = n.path("outOfScope").asBoolean(false);
                 if (oos) continue;
 
@@ -882,9 +953,6 @@ public class RagAnswerService {
         return topScore < MIN_KB_SCORE_FOR_ANSWER;
     }
 
-    /**
-     * Extract BOTH QA question + answer (if possible) and compute matchScore vs user question keywords.
-     */
     private List<QaCandidate> extractQaCandidates(RagRetrievalResult retrieval, String userQuestion) {
         if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) return List.of();
 
