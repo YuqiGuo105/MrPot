@@ -11,6 +11,7 @@ import org.springframework.util.MimeTypeUtils;
 import reactor.core.publisher.Mono;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Locale;
 
 @Service
@@ -42,10 +43,10 @@ public class FileExtractionService {
                 }
 
                 text = clamp(text, MAX_EXTRACT_CHARS);
-                return new ExtractedFile(f.uri(), f.filename(), f.mimeType(), f.sizeBytes(), text, null);
+                return new ExtractedFile(f.uri(), f.filename(), f.mimeType(), f.sizeBytes(), text, null, null, List.of());
 
             } catch (Exception ex) {
-                return new ExtractedFile(f.uri(), f.filename(), f.mimeType(), f.sizeBytes(), "", ex.toString());
+                return new ExtractedFile(f.uri(), f.filename(), f.mimeType(), f.sizeBytes(), "", ex.toString(), null, List.of());
             }
         });
     }
@@ -55,9 +56,9 @@ public class FileExtractionService {
 
         // English comments: Keep instruction short to reduce tokens.
         String instruction =
-                "Extract readable text from the image. " +
-                        "If no text, describe key objects briefly. " +
-                        "Plain text only.";
+                "You are DeepSeek-OCR. Extract readable text from the image. " +
+                        "If the image lacks text, briefly describe the key objects. " +
+                        "Respond with plain text only.";
 
         return visionClient.prompt()
                 .user(u -> u.text(instruction).media(mt, new ByteArrayResource(bytes)))

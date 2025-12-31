@@ -25,7 +25,8 @@ public record AttachmentContext(
                 "url", f.uri().toString(),
                 "preview", f.preview(previewChars),
                 "chars", f.extractedText() == null ? 0 : f.extractedText().length(),
-                "error", f.error() == null ? "" : f.error()
+                "error", f.error() == null ? "" : f.error(),
+                "keyInfo", f.keyInfoJson() == null ? "" : f.keyInfoJson()
         )).toList();
     }
 }

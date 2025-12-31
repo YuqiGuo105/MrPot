@@ -59,6 +59,7 @@ public class RagAnswerService {
 
     // File-to-prompt budget (token saver)
     private static final int MAX_FILE_CONTEXT_CHARS = 3500;
+    private static final int MAX_FILE_KEY_INFO_CHARS = 1200;
     private static final int FILE_CHUNK_SIZE = 900;
     private static final int FILE_CHUNK_OVERLAP = 120;
     private static final int MAX_FILE_CHUNKS_IN_PROMPT = 2;
@@ -106,6 +107,7 @@ public class RagAnswerService {
         int topK = request.resolveTopK(DEFAULT_TOP_K);
         double minScore = request.resolveMinScore(DEFAULT_MIN_SCORE);
         String model = request.resolveModel();
+        ChatClient chatClient = resolveClient(model);
 
         // 1) Retrieval by question
         RagRetrievalResult retrieval = ragRetrievalService.retrieve(
@@ -119,11 +121,11 @@ public class RagAnswerService {
         if (!urls.isEmpty()) {
             String visionModel = Optional.ofNullable(request.resolveVisionModelOrNull())
                     .filter(s -> !s.isBlank())
-                    .orElse(RagAnswerRequest.DEFAULT_MODEL);
+                    .orElse(RagAnswerRequest.DEFAULT_VISION_MODEL);
 
             ChatClient visionClient = resolveClient(visionModel);
 
-            attach = attachmentService.fetchAndExtract(urls, visionClient)
+            attach = attachmentService.fetchAndExtract(urls, visionClient, chatClient)
                     .timeout(ATTACH_TIMEOUT)
                     .onErrorReturn(AttachmentContext.empty())
                     .blockOptional()
@@ -136,8 +138,10 @@ public class RagAnswerService {
 
         // 4) Use file keywords to refine retrieval (only when needed)
         List<String> fileKeywords = extractFileKeywords(files, MAX_FILE_QUERY_KEYWORDS);
-        if (shouldRefineRetrieval(retrieval, fileKeywords)) {
-            String expandedQuery = buildExpandedRetrievalQuery(request.question(), fileKeywords);
+        List<String> fileEntities = extractFileEntities(files, MAX_FILE_QUERY_KEYWORDS);
+        List<String> fileSignals = mergeSignals(fileKeywords, fileEntities);
+        if (shouldRefineRetrieval(retrieval, fileSignals)) {
+            String expandedQuery = buildExpandedRetrievalQuery(request.question(), fileKeywords, fileEntities);
             if (!expandedQuery.equals(request.question())) {
                 retrieval = ragRetrievalService.retrieve(new RagQueryRequest(expandedQuery, topK, minScore));
             }
@@ -146,8 +150,6 @@ public class RagAnswerService {
         boolean outOfScopeKb = isOutOfScope(retrieval);
         boolean hasAnyRef = hasAnyReference(retrieval, fileText);
         boolean noEvidence = !hasAnyRef;
-
-        ChatClient chatClient = resolveClient(model);
 
         var history = chatMemoryService.loadHistory(session.id());
         String historyText = truncate(chatMemoryService.renderHistory(history), MAX_HISTORY_CHARS);
@@ -190,11 +192,10 @@ public class RagAnswerService {
         int topK = request.resolveTopK(DEFAULT_TOP_K);
         double minScore = request.resolveMinScore(DEFAULT_MIN_SCORE);
         String model = request.resolveModel();
+        ChatClient chatClient = resolveClient(model);
 
-        return prepareContextReactive(request, topK, minScore)
+        return prepareContextReactive(request, topK, minScore, chatClient)
                 .flatMapMany(ctx -> {
-                    ChatClient chatClient = resolveClient(model);
-
                     var history = chatMemoryService.loadHistory(session.id());
                     String historyText = truncate(chatMemoryService.renderHistory(history), MAX_HISTORY_CHARS);
 
@@ -262,11 +263,11 @@ public class RagAnswerService {
         } else {
             String visionModel = Optional.ofNullable(request.resolveVisionModelOrNull())
                     .filter(s -> !s.isBlank())
-                    .orElse(RagAnswerRequest.DEFAULT_MODEL);
+                    .orElse(RagAnswerRequest.DEFAULT_VISION_MODEL);
 
             ChatClient visionClient = resolveClient(visionModel);
 
-            attachMono = attachmentService.fetchAndExtract(urls, visionClient)
+            attachMono = attachmentService.fetchAndExtract(urls, visionClient, chatClient)
                     .timeout(ATTACH_TIMEOUT)
                     .onErrorReturn(AttachmentContext.empty())
                     .subscribeOn(Schedulers.boundedElastic())
@@ -287,10 +288,12 @@ public class RagAnswerService {
 
                             List<ExtractedFile> files = (ac == null) ? List.of() : safeList(ac.files());
                             List<String> fileKeywords = extractFileKeywords(files, MAX_FILE_QUERY_KEYWORDS);
+                            List<String> fileEntities = extractFileEntities(files, MAX_FILE_QUERY_KEYWORDS);
+                            List<String> fileSignals = mergeSignals(fileKeywords, fileEntities);
 
-                            if (!shouldRefineRetrieval(r0, fileKeywords)) return Mono.just(r0);
+                            if (!shouldRefineRetrieval(r0, fileSignals)) return Mono.just(r0);
 
-                            String expandedQuery = buildExpandedRetrievalQuery(request.question(), fileKeywords);
+                            String expandedQuery = buildExpandedRetrievalQuery(request.question(), fileKeywords, fileEntities);
                             if (expandedQuery.equals(request.question())) return Mono.just(r0);
 
                             return Mono.fromCallable(() -> ragRetrievalService.retrieve(new RagQueryRequest(expandedQuery, topK, minScore)))
@@ -326,7 +329,10 @@ public class RagAnswerService {
             if (fs.isEmpty()) return Flux.just(new ThinkingEvent("file_extract", "Extracted", Map.of("count", 0)));
 
             // Emit keywords + small relevant excerpt for frontend progress display
-            List<String> kws = extractFileKeywords(fs, PROGRESS_KEYWORDS);
+            List<String> kws = mergeSignals(
+                    extractFileKeywords(fs, PROGRESS_KEYWORDS),
+                    extractFileEntities(fs, PROGRESS_KEYWORDS)
+            );
             String excerpts = truncate(buildFileContext(request.question(), fs), PROGRESS_EXCERPT_CHARS);
 
             Map<String, Object> payload = new LinkedHashMap<>();
@@ -422,7 +428,7 @@ public class RagAnswerService {
     // Reactive preparation helper
     // --------------------------
 
-    private Mono<PreparedContext> prepareContextReactive(RagAnswerRequest request, int topK, double minScore) {
+    private Mono<PreparedContext> prepareContextReactive(RagAnswerRequest request, int topK, double minScore, ChatClient keyInfoClient) {
         List<String> urls = request.resolveFileUrls(MAX_FILE_URLS);
 
         Mono<AttachmentContext> attachMono;
@@ -431,11 +437,11 @@ public class RagAnswerService {
         } else {
             String visionModel = Optional.ofNullable(request.resolveVisionModelOrNull())
                     .filter(s -> !s.isBlank())
-                    .orElse(RagAnswerRequest.DEFAULT_MODEL);
+                    .orElse(RagAnswerRequest.DEFAULT_VISION_MODEL);
 
             ChatClient visionClient = resolveClient(visionModel);
 
-            attachMono = attachmentService.fetchAndExtract(urls, visionClient)
+            attachMono = attachmentService.fetchAndExtract(urls, visionClient, keyInfoClient)
                     .timeout(ATTACH_TIMEOUT)
                     .onErrorReturn(AttachmentContext.empty())
                     .subscribeOn(Schedulers.boundedElastic())
@@ -455,10 +461,12 @@ public class RagAnswerService {
 
                             List<ExtractedFile> files = (ac == null) ? List.of() : safeList(ac.files());
                             List<String> fileKeywords = extractFileKeywords(files, MAX_FILE_QUERY_KEYWORDS);
+                            List<String> fileEntities = extractFileEntities(files, MAX_FILE_QUERY_KEYWORDS);
+                            List<String> fileSignals = mergeSignals(fileKeywords, fileEntities);
 
-                            if (!shouldRefineRetrieval(r0, fileKeywords)) return Mono.just(r0);
+                            if (!shouldRefineRetrieval(r0, fileSignals)) return Mono.just(r0);
 
-                            String expandedQuery = buildExpandedRetrievalQuery(request.question(), fileKeywords);
+                            String expandedQuery = buildExpandedRetrievalQuery(request.question(), fileKeywords, fileEntities);
                             if (expandedQuery.equals(request.question())) return Mono.just(r0);
 
                             return Mono.fromCallable(() -> ragRetrievalService.retrieve(new RagQueryRequest(expandedQuery, topK, minScore)))
@@ -487,26 +495,41 @@ public class RagAnswerService {
     // Retrieval expansion
     // --------------------------
 
-    private static boolean shouldRefineRetrieval(RagRetrievalResult retrieval, List<String> fileKeywords) {
-        if (fileKeywords == null || fileKeywords.isEmpty()) return false;
+    private static boolean shouldRefineRetrieval(RagRetrievalResult retrieval, List<String> fileSignals) {
+        if (fileSignals == null || fileSignals.isEmpty()) return false;
         if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) return true;
 
         double top = retrieval.documents().stream().mapToDouble(ScoredDocument::score).max().orElse(0.0);
         return top < REFINE_TOP_SCORE_THRESHOLD;
     }
 
-    private static String buildExpandedRetrievalQuery(String question, List<String> fileKeywords) {
+    private static String buildExpandedRetrievalQuery(String question, List<String> fileKeywords, List<String> fileEntities) {
         String q = (question == null) ? "" : question.trim();
         if (q.isBlank()) q = "";
 
-        if (fileKeywords == null || fileKeywords.isEmpty()) return q;
+        boolean hasKeywords = fileKeywords != null && !fileKeywords.isEmpty();
+        boolean hasEntities = fileEntities != null && !fileEntities.isEmpty();
+        if (!hasKeywords && !hasEntities) return q;
 
-        String joined = String.join(", ", fileKeywords);
-        if (joined.length() > MAX_FILE_QUERY_CHARS) {
-            joined = joined.substring(0, MAX_FILE_QUERY_CHARS) + "...";
+        StringBuilder sb = new StringBuilder(q);
+
+        if (hasKeywords) {
+            String joined = String.join(", ", fileKeywords);
+            if (joined.length() > MAX_FILE_QUERY_CHARS) {
+                joined = joined.substring(0, MAX_FILE_QUERY_CHARS) + "...";
+            }
+            sb.append("\nFile keywords: ").append(joined);
         }
 
-        return q + "\nFile keywords: " + joined;
+        if (hasEntities) {
+            String joined = String.join(", ", fileEntities);
+            if (joined.length() > MAX_FILE_QUERY_CHARS) {
+                joined = joined.substring(0, MAX_FILE_QUERY_CHARS) + "...";
+            }
+            sb.append("\nFile entities: ").append(joined);
+        }
+
+        return sb.toString();
     }
 
     /**
@@ -527,6 +550,12 @@ public class RagAnswerService {
         for (ExtractedFile f : files) {
             if (f == null) continue;
             if (f.error() != null && !f.error().isBlank()) continue;
+
+            // 0) Structured entities from key-info JSON (boosted)
+            for (String ent : f.entitiesOrEmpty()) {
+                String kw = normalizeKeyword(ent);
+                if (!isNoiseToken(kw)) bump(freq, kw, 4);
+            }
 
             // 1) Filename tokens (boosted)
             String filename = Optional.ofNullable(f.filename()).orElse("");
@@ -591,6 +620,30 @@ public class RagAnswerService {
                 .map(Map.Entry::getKey)
                 .limit(maxK)
                 .toList();
+    }
+
+    private static List<String> extractFileEntities(List<ExtractedFile> files, int maxK) {
+        if (files == null || files.isEmpty() || maxK <= 0) return List.of();
+
+        LinkedHashSet<String> set = new LinkedHashSet<>();
+        for (ExtractedFile f : files) {
+            if (f == null) continue;
+            for (String ent : f.entitiesOrEmpty()) {
+                String v = normalizeKeyword(ent);
+                if (isNoiseToken(v)) continue;
+                set.add(v);
+                if (set.size() >= maxK) break;
+            }
+            if (set.size() >= maxK) break;
+        }
+        return new ArrayList<>(set);
+    }
+
+    private static List<String> mergeSignals(List<String> keywords, List<String> entities) {
+        LinkedHashSet<String> set = new LinkedHashSet<>();
+        if (keywords != null) set.addAll(keywords);
+        if (entities != null) set.addAll(entities);
+        return new ArrayList<>(set);
     }
 
     private static void bump(Map<String, Integer> freq, String kw, int delta) {
@@ -726,6 +779,24 @@ public class RagAnswerService {
     private String buildFileContext(String question, List<ExtractedFile> files) {
         if (files == null || files.isEmpty()) return "";
 
+        String keyInfoSection = buildFileKeyInfoSection(files);
+        String excerptSection = buildFileExcerptSection(question, files);
+
+        if (keyInfoSection.isBlank() && excerptSection.isBlank()) return "";
+
+        StringBuilder sb = new StringBuilder();
+        if (!keyInfoSection.isBlank()) {
+            sb.append(keyInfoSection);
+            if (!excerptSection.isBlank()) sb.append("\n\n");
+        }
+        if (!excerptSection.isBlank()) sb.append(excerptSection);
+
+        return truncate(sb.toString(), MAX_FILE_CONTEXT_CHARS);
+    }
+
+    private String buildFileExcerptSection(String question, List<ExtractedFile> files) {
+        if (files == null || files.isEmpty()) return "";
+
         List<String> keywords = extractKeywords(question);
         if (keywords.isEmpty()) keywords = List.of();
 
@@ -782,6 +853,36 @@ public class RagAnswerService {
         }
 
         return truncate(sb.toString(), MAX_FILE_CONTEXT_CHARS);
+    }
+
+    private String buildFileKeyInfoSection(List<ExtractedFile> files) {
+        if (files == null || files.isEmpty()) return "";
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("File Key Info (JSON):\n");
+
+        int used = 0;
+        for (ExtractedFile f : files) {
+            if (f == null) continue;
+            String keyInfo = Optional.ofNullable(f.keyInfoJson()).orElse("").trim();
+            if (keyInfo.isBlank()) continue;
+
+            String header = "- (" + safe(f.filename(), "file") + ", " + safe(f.mimeType(), "application/octet-stream") + ")\n";
+            int budget = MAX_FILE_KEY_INFO_CHARS - used - header.length() - 2;
+            if (budget <= 0) break;
+
+            if (keyInfo.length() > budget) {
+                keyInfo = keyInfo.substring(0, budget) + "...";
+            }
+
+            sb.append(header).append(keyInfo).append("\n\n");
+            used += header.length() + keyInfo.length() + 2;
+
+            if (used >= MAX_FILE_KEY_INFO_CHARS) break;
+        }
+
+        String out = sb.toString().trim();
+        return out.isBlank() ? "" : out;
     }
 
     private static String safe(String s, String d) {
@@ -852,6 +953,7 @@ public class RagAnswerService {
                 "name", safe(f.filename(), "file"),
                 "mime", safe(f.mimeType(), "application/octet-stream"),
                 "preview", truncate(Optional.ofNullable(f.extractedText()).orElse(""), 400),
+                "keyInfo", truncate(Optional.ofNullable(f.keyInfoJson()).orElse(""), 400),
                 "error", Optional.ofNullable(f.error()).orElse("")
         )).toList();
     }
