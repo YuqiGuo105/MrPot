@@ -29,6 +29,7 @@ public record RagAnswerRequest(
 ) {
     private static final Set<String> models = Set.of("deepseek", "gemini", "openai");
     public static final String DEFAULT_MODEL = "deepseek";
+    public static final String DEFAULT_VISION_MODEL = "deepseek";
 
     public int resolveTopK(int defaultValue) {
         return topK == null || topK <= 0 ? defaultValue : topK;
@@ -53,7 +54,7 @@ public record RagAnswerRequest(
 
     public String resolveVisionModelOrNull() {
         String key = normalizeModelKey(visionModel);
-        return (key == null || !models.contains(key)) ? DEFAULT_MODEL : key;
+        return (key == null || !models.contains(key)) ? DEFAULT_VISION_MODEL : key;
     }
 
     private static String normalizeModelKey(String s) {
