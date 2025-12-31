@@ -3,6 +3,8 @@ package com.example.MrPot.model;
 import com.example.MrPot.tools.ToolProfile;
 
 import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 
 /**
@@ -21,7 +23,9 @@ public record RagAnswerRequest(
         Integer topK,
         Double minScore,
         String model,
-        String toolProfile
+        String toolProfile,
+        List<String> fileUrls,
+        String visionModel
 ) {
     private static final Set<String> models = Set.of("deepseek", "gemini", "openai");
     public static final String DEFAULT_MODEL = "deepseek";
@@ -37,6 +41,25 @@ public record RagAnswerRequest(
     public String resolveModel() {
         return (model == null || model.isBlank()
         || !models.contains(model)) ? DEFAULT_MODEL : model;
+    }
+
+    public List<String> resolveFileUrls(int maxFiles) {
+        if (fileUrls == null || fileUrls.isEmpty()) return List.of();
+        return fileUrls.stream()
+                .filter(u -> u != null && !u.isBlank())
+                .limit(Math.max(0, maxFiles))
+                .toList();
+    }
+
+    public String resolveVisionModelOrNull() {
+        String key = normalizeModelKey(visionModel);
+        return (key == null || !models.contains(key)) ? DEFAULT_MODEL : key;
+    }
+
+    private static String normalizeModelKey(String s) {
+        if (s == null) return null;
+        String key = s.trim().toLowerCase(Locale.ROOT);
+        return key.isBlank() ? null : key;
     }
 
     public ResolvedSession resolveSession() {

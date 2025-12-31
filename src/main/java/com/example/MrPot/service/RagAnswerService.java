@@ -1,11 +1,6 @@
 package com.example.MrPot.service;
 
-import com.example.MrPot.model.RagAnswer;
-import com.example.MrPot.model.RagAnswerRequest;
-import com.example.MrPot.model.RagQueryRequest;
-import com.example.MrPot.model.RagRetrievalResult;
-import com.example.MrPot.model.ScoredDocument;
-import com.example.MrPot.model.ThinkingEvent;
+import com.example.MrPot.model.*;
 import com.example.MrPot.tools.ToolProfile;
 import com.example.MrPot.tools.ToolRegistry;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -17,11 +12,8 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.time.Duration;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -37,6 +29,10 @@ public class RagAnswerService {
 
     // --- Minimal analytics logger (2-table design) ---
     private final RagRunLogger runLogger;
+    private final LogIngestionClient logIngestionClient;
+
+    // --- URL file fetch + extract (Tika / vision) ---
+    private final AttachmentService attachmentService;
 
     private static final int DEFAULT_TOP_K = 3;
     private static final double DEFAULT_MIN_SCORE = 0.60;
@@ -44,7 +40,7 @@ public class RagAnswerService {
     // Minimum similarity score required to consider a question "in scope" of the KB
     private static final double MIN_KB_SCORE_FOR_ANSWER = 0.15;
 
-    // Fixed fallback reply when the question is beyond the knowledge base
+    // Internal canonical fallback marker (for logs/filters only; NOT required to be user-facing)
     private static final String OUT_OF_SCOPE_REPLY = "I can only answer Yuqi's related stuff.";
 
     // Prompt size controls (reduce token usage and latency)
@@ -57,29 +53,49 @@ public class RagAnswerService {
     // Keep only a few latest log rows in prompt (token saver)
     private static final int MAX_LOG_ROWS_IN_PROMPT = 8;
 
+    // URL attachment constraints
+    private static final int MAX_FILE_URLS = 2;
+    private static final Duration ATTACH_TIMEOUT = Duration.ofSeconds(30);
+
+    // File-to-prompt budget (token saver)
+    private static final int MAX_FILE_CONTEXT_CHARS = 3500;
+    private static final int FILE_CHUNK_SIZE = 900;
+    private static final int FILE_CHUNK_OVERLAP = 120;
+    private static final int MAX_FILE_CHUNKS_IN_PROMPT = 2;
+
+    // --- File keywords -> retrieval expansion budget ---
+    private static final int MAX_FILE_QUERY_KEYWORDS = 2;
+    private static final int MAX_FILE_QUERY_CHARS = 480;
+
+    // --- Heuristic: only refine retrieval if initial is weak ---
+    private static final double REFINE_TOP_SCORE_THRESHOLD = 0.25;
+
+    // --- QA hint match thresholds (avoid blind copying) ---
+    private static final int QA_MATCH_HIGH = 6;
+    private static final int QA_MATCH_MED = 3;
+
+    // --- Frontend progress payload limits ---
+    private static final int PROGRESS_EXCERPT_CHARS = 900;
+    private static final int PROGRESS_KEYWORDS = 8;
+
     private static final ObjectMapper OM = new ObjectMapper();
 
-    // Keep style minimal to reduce tokens
-    private static final String RESPONSE_STYLE =
-            "Be concise. Plain text. Bullets only if helpful. Raw https:// links only.";
-
     /**
-     * Low-token, accuracy-first system prompt:
-     * - Evidence grounded for Yuqi-specific/private facts
-     * - Allow friendly human-like tone
-     * - Allow normal answers for general how-to/coding/capability questions
-     * - Treat Q/A blocks as strong evidence
-     * - Strict fallback string when needed
+     * Revised:
+     * 1) More creative + humor allowed (still grounded, not mean)
+     * 2) General how-to/coding: answer normally
+     * 3) No-evidence: refuse in user's language (same meaning as OUT_OF_SCOPE_REPLY), not hard-coded
      */
-    private static final String SYSTEM_BASE =
-            "You are Mr Pot, Yuqi's assistant. " +
-                    "Use History/Context as evidence; do not add unsupported facts. " +
-                    "You may sound friendly, slightly playful, and human-like. " +
-                    "If Context has Q/A blocks (【问题】/【回答】), treat the Answer as strong evidence; you may polish. " +
-                    "If asked for a number but evidence only supports a status/statement, answer that supported status/statement. " +
-                    "For general how-to/coding/capability questions: answer normally. " +
-                    "If Yuqi-specific/private facts lack evidence, reply exactly: \"" + OUT_OF_SCOPE_REPLY + "\". " +
-                    "Reply in the user's language. ";
+    private static final String SYSTEM_PROMPT =
+            "You are Mr Pot (Yuqi's assistant). Reply in the user's language. " +
+                    "Tone: warm, witty, a little humorous when appropriate (no sarcasm/insults; no made-up facts). " +
+                    "Yuqi-specific/private facts: use only evidence from CTX/FILE/HIS; never invent. " +
+                    "QA References are hints only: use only if they clearly match the user's question and do not conflict with CTX/FILE/HIS; never copy blindly. " +
+                    "If evidence is partial, answer what is supported and say what is not mentioned/unknown. " +
+                    "If there is no relevant evidence, refuse in the user's language with the same meaning as: \"" + OUT_OF_SCOPE_REPLY + "\" (one short sentence; light humor ok). " +
+                    "General how-to/coding/capability: answer normally; you may be creative. " +
+                    "Keep it short. Plain text. Bullets only if helpful. Raw links only. " +
+                    "For formulas, output WYSIWYG-friendly HTML (e.g., E = mc<sup>2</sup>).";
 
     public RagAnswer answer(RagAnswerRequest request) {
         long t0 = System.nanoTime();
@@ -89,32 +105,56 @@ public class RagAnswerService {
         double minScore = request.resolveMinScore(DEFAULT_MIN_SCORE);
         String model = request.resolveModel();
 
-        RagRetrievalResult retrieval = ragRetrievalService.retrieve(toQuery(request));
+        // 1) Retrieval by question
+        RagRetrievalResult retrieval = ragRetrievalService.retrieve(
+                new RagQueryRequest(request.question(), topK, minScore)
+        );
 
-        if (isOutOfScope(retrieval)) {
-            chatMemoryService.appendTurn(session.id(), request.question(), OUT_OF_SCOPE_REPLY, session.temporary());
+        // 2) Fetch + extract URL attachments (blocking path)
+        List<String> urls = request.resolveFileUrls(MAX_FILE_URLS);
+        AttachmentContext attach = AttachmentContext.empty();
 
-            int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
-            safeLogOnce(
-                    session.id(), request.question(), model, topK, minScore,
-                    "OUT_OF_SCOPE (no LLM call)", OUT_OF_SCOPE_REPLY, latencyMs,
-                    true, null, retrieval
-            );
+        if (!urls.isEmpty()) {
+            String visionModel = Optional.ofNullable(request.resolveVisionModelOrNull())
+                    .filter(s -> !s.isBlank())
+                    .orElse(RagAnswerRequest.DEFAULT_MODEL);
 
-            return new RagAnswer(OUT_OF_SCOPE_REPLY, retrieval.documents());
+            ChatClient visionClient = resolveClient(visionModel);
+
+            attach = attachmentService.fetchAndExtract(urls, visionClient)
+                    .timeout(ATTACH_TIMEOUT)
+                    .onErrorReturn(AttachmentContext.empty())
+                    .blockOptional()
+                    .orElse(AttachmentContext.empty());
         }
+
+        // 3) Build file context for prompt (budgeted)
+        List<ExtractedFile> files = (attach == null) ? List.of() : safeList(attach.files());
+        String fileText = buildFileContext(request.question(), files);
+
+        // 4) Use file keywords to refine retrieval (only when needed)
+        List<String> fileKeywords = extractFileKeywords(files, MAX_FILE_QUERY_KEYWORDS);
+        if (shouldRefineRetrieval(retrieval, fileKeywords)) {
+            String expandedQuery = buildExpandedRetrievalQuery(request.question(), fileKeywords);
+            if (!expandedQuery.equals(request.question())) {
+                retrieval = ragRetrievalService.retrieve(new RagQueryRequest(expandedQuery, topK, minScore));
+            }
+        }
+
+        boolean outOfScopeKb = isOutOfScope(retrieval);
+        boolean hasAnyRef = hasAnyReference(retrieval, fileText);
+        boolean noEvidence = !hasAnyRef;
 
         ChatClient chatClient = resolveClient(model);
 
         var history = chatMemoryService.loadHistory(session.id());
         String historyText = truncate(chatMemoryService.renderHistory(history), MAX_HISTORY_CHARS);
 
-        // Resolve tool profile for future function-calling (kept)
         ToolProfile profile = request.resolveToolProfile(ToolProfile.BASIC_CHAT);
         toolRegistry.getFunctionBeanNamesForProfile(profile);
 
-        String prompt = buildPrompt(request.question(), retrieval, historyText);
-        String systemPrompt = SYSTEM_BASE + RESPONSE_STYLE;
+        String prompt = buildPrompt(request.question(), retrieval, historyText, fileText, noEvidence, outOfScopeKb);
+        String systemPrompt = SYSTEM_PROMPT;
 
         String answer;
         String error = null;
@@ -129,7 +169,7 @@ public class RagAnswerService {
             error = ex.toString();
             int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
             safeLogOnce(session.id(), request.question(), model, topK, minScore,
-                    prompt, answer, latencyMs, false, error, retrieval);
+                    prompt, answer, latencyMs, noEvidence, error, retrieval);
             throw ex;
         }
 
@@ -137,9 +177,9 @@ public class RagAnswerService {
 
         int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
         safeLogOnce(session.id(), request.question(), model, topK, minScore,
-                prompt, answer, latencyMs, false, null, retrieval);
+                prompt, answer, latencyMs, noEvidence, null, retrieval);
 
-        return new RagAnswer(answer, retrieval.documents());
+        return new RagAnswer(answer, retrieval == null ? List.of() : retrieval.documents());
     }
 
     public Flux<String> streamAnswer(RagAnswerRequest request) {
@@ -150,47 +190,46 @@ public class RagAnswerService {
         double minScore = request.resolveMinScore(DEFAULT_MIN_SCORE);
         String model = request.resolveModel();
 
-        RagRetrievalResult retrieval = ragRetrievalService.retrieve(toQuery(request));
+        // Do NOT block event-loop. Prepare everything reactively.
+        return prepareContextReactive(request, topK, minScore)
+                .flatMapMany(ctx -> {
+                    ChatClient chatClient = resolveClient(model);
 
-        if (isOutOfScope(retrieval)) {
-            chatMemoryService.appendTurn(session.id(), request.question(), OUT_OF_SCOPE_REPLY, session.temporary());
+                    var history = chatMemoryService.loadHistory(session.id());
+                    String historyText = truncate(chatMemoryService.renderHistory(history), MAX_HISTORY_CHARS);
 
-            int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
-            safeLogOnce(session.id(), request.question(), model, topK, minScore,
-                    "OUT_OF_SCOPE (no LLM call)", OUT_OF_SCOPE_REPLY, latencyMs, true, null, retrieval);
+                    boolean noEvidence = !ctx.hasAnyRef;
+                    String prompt = buildPrompt(
+                            request.question(),
+                            ctx.retrieval,
+                            historyText,
+                            ctx.fileText,
+                            noEvidence,
+                            ctx.outOfScopeKb
+                    );
 
-            return Flux.just(OUT_OF_SCOPE_REPLY);
-        }
+                    AtomicReference<StringBuilder> aggregate = new AtomicReference<>(new StringBuilder());
+                    AtomicReference<String> errorRef = new AtomicReference<>(null);
 
-        ChatClient chatClient = resolveClient(model);
+                    return chatClient.prompt()
+                            .system(SYSTEM_PROMPT)
+                            .user(prompt)
+                            .stream()
+                            .content()
+                            .doOnNext(delta -> aggregate.get().append(delta))
+                            .doOnError(ex -> errorRef.set(ex.toString()))
+                            .doFinally(signalType -> {
+                                String finalAnswer = aggregate.get().toString();
+                                chatMemoryService.appendTurn(session.id(), request.question(), finalAnswer, session.temporary());
 
-        var history = chatMemoryService.loadHistory(session.id());
-        String historyText = truncate(chatMemoryService.renderHistory(history), MAX_HISTORY_CHARS);
-
-        String prompt = buildPrompt(request.question(), retrieval, historyText);
-        String systemPrompt = SYSTEM_BASE + RESPONSE_STYLE;
-
-        AtomicReference<StringBuilder> aggregate = new AtomicReference<>(new StringBuilder());
-        AtomicReference<String> errorRef = new AtomicReference<>(null);
-
-        return chatClient.prompt()
-                .system(systemPrompt)
-                .user(prompt)
-                .stream()
-                .content()
-                .doOnNext(delta -> aggregate.get().append(delta))
-                .doOnError(ex -> errorRef.set(ex.toString()))
-                .doFinally(signalType -> {
-                    String finalAnswer = aggregate.get().toString();
-                    chatMemoryService.appendTurn(session.id(), request.question(), finalAnswer, session.temporary());
-
-                    Mono.fromRunnable(() -> {
-                                int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
-                                safeLogOnce(session.id(), request.question(), model, topK, minScore,
-                                        prompt, finalAnswer, latencyMs, false, errorRef.get(), retrieval);
-                            })
-                            .subscribeOn(Schedulers.boundedElastic())
-                            .subscribe();
+                                Mono.fromRunnable(() -> {
+                                            int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
+                                            safeLogOnce(session.id(), request.question(), model, topK, minScore,
+                                                    prompt, finalAnswer, latencyMs, noEvidence, errorRef.get(), ctx.retrieval);
+                                        })
+                                        .subscribeOn(Schedulers.boundedElastic())
+                                        .subscribe();
+                            });
                 });
     }
 
@@ -206,7 +245,7 @@ public class RagAnswerService {
         AtomicReference<StringBuilder> aggregate = new AtomicReference<>(new StringBuilder());
 
         AtomicReference<String> promptRef = new AtomicReference<>(null);
-        AtomicReference<Boolean> outOfScopeRef = new AtomicReference<>(false);
+        AtomicReference<Boolean> noEvidenceRef = new AtomicReference<>(false);
         AtomicReference<RagRetrievalResult> retrievalRef = new AtomicReference<>(null);
         AtomicReference<String> errorRef = new AtomicReference<>(null);
 
@@ -215,53 +254,121 @@ public class RagAnswerService {
                         .subscribeOn(Schedulers.boundedElastic())
                         .cache();
 
+        // --- URL attachments (reactive) ---
+        List<String> urls = request.resolveFileUrls(MAX_FILE_URLS);
+        Mono<AttachmentContext> attachMono;
+        if (urls.isEmpty()) {
+            attachMono = Mono.just(AttachmentContext.empty());
+        } else {
+            String visionModel = Optional.ofNullable(request.resolveVisionModelOrNull())
+                    .filter(s -> !s.isBlank())
+                    .orElse(RagAnswerRequest.DEFAULT_MODEL);
+
+            ChatClient visionClient = resolveClient(visionModel);
+
+            attachMono = attachmentService.fetchAndExtract(urls, visionClient)
+                    .timeout(ATTACH_TIMEOUT)
+                    .onErrorReturn(AttachmentContext.empty())
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .cache();
+        }
+
+        // --- Retrieval (2-phase with refinement based on file keywords) ---
         Mono<RagRetrievalResult> retrievalMono =
-                Mono.fromCallable(() -> ragRetrievalService.retrieve(toQuery(request)))
+                Mono.fromCallable(() -> ragRetrievalService.retrieve(new RagQueryRequest(request.question(), topK, minScore)))
                         .subscribeOn(Schedulers.boundedElastic())
+                        .cache();
+
+        Mono<RagRetrievalResult> retrievalFinalMono =
+                Mono.zip(retrievalMono, attachMono)
+                        .flatMap(tuple -> {
+                            RagRetrievalResult r0 = tuple.getT1();
+                            AttachmentContext ac = tuple.getT2();
+
+                            List<ExtractedFile> files = (ac == null) ? List.of() : safeList(ac.files());
+                            List<String> fileKeywords = extractFileKeywords(files, MAX_FILE_QUERY_KEYWORDS);
+
+                            if (!shouldRefineRetrieval(r0, fileKeywords)) return Mono.just(r0);
+
+                            String expandedQuery = buildExpandedRetrievalQuery(request.question(), fileKeywords);
+                            if (expandedQuery.equals(request.question())) return Mono.just(r0);
+
+                            return Mono.fromCallable(() -> ragRetrievalService.retrieve(new RagQueryRequest(expandedQuery, topK, minScore)))
+                                    .subscribeOn(Schedulers.boundedElastic())
+                                    .onErrorReturn(r0);
+                        })
                         .cache();
 
         Flux<ThinkingEvent> startStep = Flux.just(
                 new ThinkingEvent("start", "Init", Map.of("ts", System.currentTimeMillis()))
         );
 
+        // Progress: emit URL list immediately (so frontend can show "fetching...")
+        Flux<ThinkingEvent> fileFetchStartStep = Flux.defer(() -> {
+            if (urls.isEmpty()) return Flux.empty();
+            return Flux.just(new ThinkingEvent(
+                    "file_fetch_start",
+                    "Fetching",
+                    Map.of("count", urls.size(), "urls", urls)
+            ));
+        });
+
+        // file_fetch/file_extract happen BEFORE redis/rag/answer (order is enforced by concat below)
+        Flux<ThinkingEvent> fileFetchStep = attachMono.flatMapMany(ctx -> {
+            if (urls.isEmpty()) return Flux.empty();
+            List<ExtractedFile> fs = (ctx == null) ? List.of() : safeList(ctx.files());
+            if (fs.isEmpty()) return Flux.just(new ThinkingEvent("file_fetch", "Fetched", Map.of("count", 0)));
+            return Flux.just(new ThinkingEvent("file_fetch", "Fetched", summarizeFilesFetched(fs)));
+        });
+
+        Flux<ThinkingEvent> fileExtractStep = attachMono.flatMapMany(ctx -> {
+            if (urls.isEmpty()) return Flux.empty();
+            List<ExtractedFile> fs = (ctx == null) ? List.of() : safeList(ctx.files());
+            if (fs.isEmpty()) return Flux.just(new ThinkingEvent("file_extract", "Extracted", Map.of("count", 0)));
+
+            // Emit keywords + a small relevant excerpt for frontend progress display
+            List<String> kws = extractFileKeywords(fs, PROGRESS_KEYWORDS);
+            String excerpts = truncate(buildFileContext(request.question(), fs), PROGRESS_EXCERPT_CHARS);
+
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("files", summarizeFilesExtracted(fs));
+            payload.put("keywords", kws);
+            payload.put("excerpts", excerpts);
+
+            return Flux.just(new ThinkingEvent("file_extract", "Extracted", payload));
+        });
+
         Flux<ThinkingEvent> redisStep = historyMono.flatMapMany(history ->
                 Flux.just(new ThinkingEvent("redis", "History", summarizeHistory(history)))
         );
 
-        Flux<ThinkingEvent> ragStep = retrievalMono.flatMapMany(retrieval ->
+        Flux<ThinkingEvent> ragStep = retrievalFinalMono.flatMapMany(retrieval ->
                 Flux.just(new ThinkingEvent("rag", "Retrieval", summarizeRetrieval(retrieval)))
         );
 
         Flux<ThinkingEvent> answerDeltaStep =
-                Mono.zip(historyMono, retrievalMono)
+                Mono.zip(historyMono, retrievalFinalMono, attachMono)
                         .flatMapMany(tuple -> {
                             var history = tuple.getT1();
                             var retrieval = tuple.getT2();
+                            var attach = tuple.getT3();
 
                             retrievalRef.set(retrieval);
 
-                            if (isOutOfScope(retrieval)) {
-                                outOfScopeRef.set(true);
-                                promptRef.set("OUT_OF_SCOPE (no LLM call)");
-                                aggregate.get().append(OUT_OF_SCOPE_REPLY);
+                            List<ExtractedFile> files = (attach == null) ? List.of() : safeList(attach.files());
+                            String fileText = buildFileContext(request.question(), files);
 
-                                return Flux.just(new ThinkingEvent(
-                                        "answer_delta",
-                                        "Out-of-scope",
-                                        OUT_OF_SCOPE_REPLY
-                                ));
-                            }
-
-                            outOfScopeRef.set(false);
+                            boolean outOfScopeKb = isOutOfScope(retrieval);
+                            boolean hasAnyRef = hasAnyReference(retrieval, fileText);
+                            boolean noEvidence = !hasAnyRef;
+                            noEvidenceRef.set(noEvidence);
 
                             String historyText = truncate(chatMemoryService.renderHistory(history), MAX_HISTORY_CHARS);
-                            String prompt = buildPrompt(request.question(), retrieval, historyText);
+                            String prompt = buildPrompt(request.question(), retrieval, historyText, fileText, noEvidence, outOfScopeKb);
                             promptRef.set(prompt);
 
-                            String systemPrompt = SYSTEM_BASE + RESPONSE_STYLE;
-
                             return chatClient.prompt()
-                                    .system(systemPrompt)
+                                    .system(SYSTEM_PROMPT)
                                     .user(prompt)
                                     .stream()
                                     .content()
@@ -286,7 +393,7 @@ public class RagAnswerService {
                                                 promptRef.get(),
                                                 finalAnswer,
                                                 latencyMs,
-                                                Boolean.TRUE.equals(outOfScopeRef.get()),
+                                                Boolean.TRUE.equals(noEvidenceRef.get()),
                                                 errorRef.get(),
                                                 retrievalRef.get()
                                         );
@@ -299,16 +406,170 @@ public class RagAnswerService {
                 Flux.just(new ThinkingEvent("answer_final", "Done", aggregate.get().toString()))
         );
 
-        return Flux.concat(startStep, redisStep, ragStep, answerDeltaStep, finalStep);
-    }
-
-    private RagQueryRequest toQuery(RagAnswerRequest request) {
-        return new RagQueryRequest(
-                request.question(),
-                request.resolveTopK(DEFAULT_TOP_K),
-                request.resolveMinScore(DEFAULT_MIN_SCORE)
+        return Flux.concat(
+                startStep,
+                fileFetchStartStep,
+                fileFetchStep,
+                fileExtractStep,
+                redisStep,
+                ragStep,
+                answerDeltaStep,
+                finalStep
         );
     }
+
+    // --------------------------
+    // Reactive preparation helper
+    // --------------------------
+
+    private Mono<PreparedContext> prepareContextReactive(RagAnswerRequest request, int topK, double minScore) {
+        List<String> urls = request.resolveFileUrls(MAX_FILE_URLS);
+
+        Mono<AttachmentContext> attachMono;
+        if (urls.isEmpty()) {
+            attachMono = Mono.just(AttachmentContext.empty());
+        } else {
+            String visionModel = Optional.ofNullable(request.resolveVisionModelOrNull())
+                    .filter(s -> !s.isBlank())
+                    .orElse(RagAnswerRequest.DEFAULT_MODEL);
+
+            ChatClient visionClient = resolveClient(visionModel);
+
+            attachMono = attachmentService.fetchAndExtract(urls, visionClient)
+                    .timeout(ATTACH_TIMEOUT)
+                    .onErrorReturn(AttachmentContext.empty())
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .cache();
+        }
+
+        Mono<RagRetrievalResult> retrievalMono =
+                Mono.fromCallable(() -> ragRetrievalService.retrieve(new RagQueryRequest(request.question(), topK, minScore)))
+                        .subscribeOn(Schedulers.boundedElastic())
+                        .cache();
+
+        Mono<RagRetrievalResult> retrievalFinalMono =
+                Mono.zip(retrievalMono, attachMono)
+                        .flatMap(tuple -> {
+                            RagRetrievalResult r0 = tuple.getT1();
+                            AttachmentContext ac = tuple.getT2();
+
+                            List<ExtractedFile> files = (ac == null) ? List.of() : safeList(ac.files());
+                            List<String> fileKeywords = extractFileKeywords(files, MAX_FILE_QUERY_KEYWORDS);
+
+                            if (!shouldRefineRetrieval(r0, fileKeywords)) return Mono.just(r0);
+
+                            String expandedQuery = buildExpandedRetrievalQuery(request.question(), fileKeywords);
+                            if (expandedQuery.equals(request.question())) return Mono.just(r0);
+
+                            return Mono.fromCallable(() -> ragRetrievalService.retrieve(new RagQueryRequest(expandedQuery, topK, minScore)))
+                                    .subscribeOn(Schedulers.boundedElastic())
+                                    .onErrorReturn(r0);
+                        })
+                        .cache();
+
+        return Mono.zip(retrievalFinalMono, attachMono)
+                .map(tuple -> {
+                    RagRetrievalResult retrieval = tuple.getT1();
+                    AttachmentContext ac = tuple.getT2();
+                    List<ExtractedFile> files = (ac == null) ? List.of() : safeList(ac.files());
+
+                    String fileText = buildFileContext(request.question(), files);
+                    boolean outOfScopeKb = isOutOfScope(retrieval);
+                    boolean hasAnyRef = hasAnyReference(retrieval, fileText);
+
+                    return new PreparedContext(retrieval, fileText, outOfScopeKb, hasAnyRef);
+                });
+    }
+
+    private record PreparedContext(RagRetrievalResult retrieval, String fileText, boolean outOfScopeKb, boolean hasAnyRef) { }
+
+    // --------------------------
+    // Retrieval expansion
+    // --------------------------
+
+    private static boolean shouldRefineRetrieval(RagRetrievalResult retrieval, List<String> fileKeywords) {
+        if (fileKeywords == null || fileKeywords.isEmpty()) return false;
+        if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) return true;
+
+        double top = retrieval.documents().stream().mapToDouble(ScoredDocument::score).max().orElse(0.0);
+        return top < REFINE_TOP_SCORE_THRESHOLD;
+    }
+
+    private static String buildExpandedRetrievalQuery(String question, List<String> fileKeywords) {
+        String q = (question == null) ? "" : question.trim();
+        if (q.isBlank()) q = "";
+
+        if (fileKeywords == null || fileKeywords.isEmpty()) return q;
+
+        String joined = String.join(", ", fileKeywords);
+        if (joined.length() > MAX_FILE_QUERY_CHARS) {
+            joined = joined.substring(0, MAX_FILE_QUERY_CHARS) + "...";
+        }
+
+        return q + "\nFile keywords: " + joined;
+    }
+
+    private static List<String> extractFileKeywords(List<ExtractedFile> files, int maxK) {
+        if (files == null || files.isEmpty() || maxK <= 0) return List.of();
+
+        LinkedHashSet<String> out = new LinkedHashSet<>();
+        for (ExtractedFile f : files) {
+            if (f == null) continue;
+            if (f.error() != null && !f.error().isBlank()) continue;
+
+            String name = f.filename();
+            if (name != null && name.length() >= 4) out.add(name);
+
+            String text = Optional.ofNullable(f.extractedText()).orElse("");
+            if (text.isBlank()) continue;
+
+            String scan = text.length() > 5000 ? text.substring(0, 5000) : text;
+
+            String[] parts = scan.toLowerCase(Locale.ROOT).split("[^\\p{IsAlphabetic}\\p{IsDigit}]+");
+            for (String p : parts) {
+                if (p == null) continue;
+                if (p.length() >= 4 && !isStopword(p)) out.add(p);
+                if (out.size() >= maxK) return out.stream().limit(maxK).toList();
+            }
+
+            Matcher m = Pattern.compile("[\\p{IsHan}]{2,}").matcher(scan);
+            while (m.find()) {
+                String w = m.group();
+                if (w != null && w.length() >= 2) out.add(w);
+                if (out.size() >= maxK) return out.stream().limit(maxK).toList();
+            }
+        }
+
+        return out.stream().limit(maxK).toList();
+    }
+
+    private static boolean isStopword(String w) {
+        if (w == null) return true;
+        String s = w.toLowerCase(Locale.ROOT);
+        return Set.of(
+                "the","and","with","from","this","that","have","will","your",
+                "http","https","www","com","org","net","file","files","image","pdf",
+                "page","pages","chapter","section","figure","table"
+        ).contains(s);
+    }
+
+    private static <T> List<T> safeList(List<T> list) {
+        return list == null ? List.of() : list;
+    }
+
+    private static boolean hasAnyReference(RagRetrievalResult retrieval, String fileText) {
+        if (fileText != null && !fileText.isBlank()) return true;
+        if (retrieval == null) return false;
+
+        if (retrieval.documents() != null && !retrieval.documents().isEmpty()) return true;
+
+        String ctx = Optional.ofNullable(retrieval.context()).orElse("");
+        return !ctx.isBlank();
+    }
+
+    // --------------------------
+    // Existing helpers (prompt + file context)
+    // --------------------------
 
     private ChatClient resolveClient(String model) {
         String key = Optional.ofNullable(model)
@@ -316,43 +577,53 @@ public class RagAnswerService {
                 .orElse(RagAnswerRequest.DEFAULT_MODEL);
 
         if (!chatClients.isEmpty()) {
-            if (chatClients.containsKey(key + "ChatClient")) {
-                return chatClients.get(key + "ChatClient");
-            }
-            if (chatClients.containsKey(key)) {
-                return chatClients.get(key);
-            }
+            if (chatClients.containsKey(key + "ChatClient")) return chatClients.get(key + "ChatClient");
+            if (chatClients.containsKey(key)) return chatClients.get(key);
         }
 
         ChatClient fallback = chatClients.get(RagAnswerRequest.DEFAULT_MODEL + "ChatClient");
-        if (fallback != null) {
-            return fallback;
-        }
+        if (fallback != null) return fallback;
 
         return chatClients.values().stream().findFirst()
                 .orElseThrow(() -> new IllegalStateException("No ChatClient beans are available"));
     }
 
-    private String buildPrompt(String question, RagRetrievalResult retrieval, String historyText) {
-        String rawContext = Optional.ofNullable(retrieval.context()).orElse("");
+    private String buildPrompt(String question,
+                               RagRetrievalResult retrieval,
+                               String historyText,
+                               String fileText,
+                               boolean noEvidence,
+                               boolean outOfScopeKb) {
+
+        String rawContext = (retrieval == null) ? "" : Optional.ofNullable(retrieval.context()).orElse("");
         String contextText = compactLogContext(rawContext, MAX_CONTEXT_CHARS);
 
-        List<QaCandidate> qaCandidates = extractQaCandidates(retrieval);
+        List<QaCandidate> qaCandidates = extractQaCandidates(retrieval, question);
 
         StringBuilder sb = new StringBuilder();
 
-        // Keep QA hints short (token saver)
+        // Small meta hint (helps avoid wrong answers)
+        sb.append("Meta: noEvidence=").append(noEvidence)
+                .append(", kbWeak=").append(outOfScopeKb)
+                .append("\n\n");
+
+        String fileSection = truncate(Optional.ofNullable(fileText).orElse(""), MAX_FILE_CONTEXT_CHARS);
+        if (!fileSection.isBlank()) {
+            sb.append("File:\n").append(fileSection).append("\n\n");
+        }
+
         if (!qaCandidates.isEmpty()) {
-            sb.append("QA Hints:\n");
+            sb.append("QA References (hint only; do not copy blindly):\n");
             for (int i = 0; i < qaCandidates.size(); i++) {
                 QaCandidate c = qaCandidates.get(i);
                 sb.append("- #").append(i + 1)
                         .append(" (score=").append(round3(c.score))
-                        .append(", id=").append(c.id)
-                        .append(", type=").append(c.type)
-                        .append(") ")
-                        .append(truncate(c.answer, 260))
-                        .append("\n");
+                        .append(", match=").append(matchLabel(c.matchScore))
+                        .append(") ");
+                String qPreview = truncate(Optional.ofNullable(c.question).orElse(""), 140);
+                String aPreview = truncate(Optional.ofNullable(c.answer).orElse(""), 220);
+                if (!qPreview.isBlank()) sb.append("Q: ").append(qPreview).append(" | ");
+                sb.append("A: ").append(aPreview).append("\n");
             }
             sb.append("\n");
         }
@@ -362,6 +633,152 @@ public class RagAnswerService {
         sb.append("Q:\n").append(question).append("\n");
 
         return sb.toString();
+    }
+
+    private static String matchLabel(int score) {
+        if (score >= QA_MATCH_HIGH) return "HIGH";
+        if (score >= QA_MATCH_MED) return "MED";
+        return "LOW";
+    }
+
+    /**
+     * Convert extracted file texts into a small, relevant prompt section.
+     * - chunk the text
+     * - score chunks by keyword overlap with question
+     * - pick top chunks
+     * - clamp to MAX_FILE_CONTEXT_CHARS
+     */
+    private String buildFileContext(String question, List<ExtractedFile> files) {
+        if (files == null || files.isEmpty()) return "";
+
+        List<String> keywords = extractKeywords(question);
+        if (keywords.isEmpty()) keywords = List.of();
+
+        record Chunk(String fileName, String mime, String text, int score) {}
+        List<Chunk> chunks = new ArrayList<>();
+
+        for (ExtractedFile f : files) {
+            if (f == null) continue;
+            if (f.error() != null && !f.error().isBlank()) continue;
+
+            String text = Optional.ofNullable(f.extractedText()).orElse("").trim();
+            if (text.isBlank()) continue;
+
+            List<String> pieceList = chunk(text, FILE_CHUNK_SIZE, FILE_CHUNK_OVERLAP);
+            for (String piece : pieceList) {
+                int score = scoreChunk(piece, keywords);
+                chunks.add(new Chunk(
+                        safe(f.filename(), "file"),
+                        safe(f.mimeType(), "application/octet-stream"),
+                        piece,
+                        score
+                ));
+            }
+        }
+
+        if (chunks.isEmpty()) return "";
+
+        chunks.sort((a, b) -> Integer.compare(b.score(), a.score()));
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("Relevant excerpts:\n");
+
+        int used = 0;
+        int taken = 0;
+        for (Chunk c : chunks) {
+            if (taken >= MAX_FILE_CHUNKS_IN_PROMPT) break;
+
+            String header = "- (" + c.fileName() + ", " + c.mime() + ")\n";
+            String body = c.text();
+
+            int addLen = header.length() + body.length() + 2;
+            if (used + addLen > MAX_FILE_CONTEXT_CHARS) {
+                int remaining = MAX_FILE_CONTEXT_CHARS - used - header.length() - 5;
+                if (remaining <= 80) break;
+                body = body.substring(0, Math.min(body.length(), remaining)) + "...";
+                addLen = header.length() + body.length() + 2;
+            }
+
+            sb.append(header).append(body).append("\n\n");
+            used += addLen;
+            taken++;
+
+            if (used >= MAX_FILE_CONTEXT_CHARS) break;
+        }
+
+        return truncate(sb.toString(), MAX_FILE_CONTEXT_CHARS);
+    }
+
+    private static String safe(String s, String d) {
+        return (s == null || s.isBlank()) ? d : s;
+    }
+
+    private static List<String> chunk(String text, int size, int overlap) {
+        String s = text == null ? "" : text;
+        if (s.isBlank()) return List.of();
+        int step = Math.max(1, size - overlap);
+
+        List<String> out = new ArrayList<>();
+        for (int i = 0; i < s.length(); i += step) {
+            int end = Math.min(s.length(), i + size);
+            String part = s.substring(i, end).trim();
+            if (!part.isBlank()) out.add(part);
+            if (end >= s.length()) break;
+        }
+        return out;
+    }
+
+    private static int scoreChunk(String chunk, List<String> keywords) {
+        if (chunk == null || chunk.isBlank() || keywords == null || keywords.isEmpty()) return 0;
+
+        String lower = chunk.toLowerCase(Locale.ROOT);
+        int score = 0;
+        for (String kw : keywords) {
+            if (kw == null || kw.isBlank()) continue;
+            String k = kw.toLowerCase(Locale.ROOT);
+
+            int idx = 0;
+            while ((idx = lower.indexOf(k, idx)) >= 0) {
+                score += 2;
+                idx += k.length();
+            }
+        }
+        return score;
+    }
+
+    private static List<String> extractKeywords(String question) {
+        if (question == null) return List.of();
+
+        List<String> tokens = new ArrayList<>();
+
+        String[] parts = question.toLowerCase(Locale.ROOT).split("[^\\p{IsAlphabetic}\\p{IsDigit}]+");
+        for (String p : parts) {
+            if (p != null && p.length() >= 3) tokens.add(p);
+        }
+
+        Matcher m = Pattern.compile("[\\p{IsHan}]{2,}").matcher(question);
+        while (m.find()) tokens.add(m.group());
+
+        LinkedHashSet<String> set = new LinkedHashSet<>(tokens);
+        return set.stream().limit(12).toList();
+    }
+
+    private List<Map<String, Object>> summarizeFilesFetched(List<ExtractedFile> files) {
+        return files.stream().map(f -> Map.<String, Object>of(
+                "url", String.valueOf(f.uri()),
+                "name", safe(f.filename(), "file"),
+                "mime", safe(f.mimeType(), "application/octet-stream"),
+                "bytes", f.sizeBytes()
+        )).toList();
+    }
+
+    private List<Map<String, Object>> summarizeFilesExtracted(List<ExtractedFile> files) {
+        return files.stream().map(f -> Map.<String, Object>of(
+                "name", safe(f.filename(), "file"),
+                "mime", safe(f.mimeType(), "application/octet-stream"),
+                "preview", truncate(Optional.ofNullable(f.extractedText()).orElse(""), 400),
+                "error", Optional.ofNullable(f.error()).orElse("")
+        )).toList();
     }
 
     // Compress log-like structured context into a few rows to reduce tokens
@@ -387,9 +804,13 @@ public class RagAnswerService {
             for (JsonNode n : rows) {
                 if (!n.isObject()) continue;
 
+                // Prefer structured flag so localized refusals won't pollute prompt
+                boolean oos = n.path("outOfScope").asBoolean(false);
+                if (oos) continue;
+
                 String q = n.path("question").asText("");
                 String a = n.path("answer").asText("");
-                if (a != null && a.trim().equals(OUT_OF_SCOPE_REPLY)) continue; // ignore stored fallback
+                if (a != null && a.trim().equals(OUT_OF_SCOPE_REPLY)) continue;
 
                 long t = n.path("createdAt").asLong(0L);
                 String id = n.path("id").asText("");
@@ -398,7 +819,6 @@ public class RagAnswerService {
                 out.add(new Row(id, t, q, a));
             }
 
-            // Newest first
             out.sort((x, y) -> Long.compare(y.createdAt, x.createdAt));
 
             StringBuilder sb = new StringBuilder();
@@ -419,11 +839,9 @@ public class RagAnswerService {
     }
 
     private List<Map<String, Object>> summarizeHistory(List<RedisChatMemoryService.StoredMessage> history) {
-        if (history == null || history.isEmpty()) {
-            return List.of();
-        }
+        if (history == null || history.isEmpty()) return List.of();
 
-        int maxMessages = 6; // last 3 turns (user+assistant)
+        int maxMessages = 6;
         int startIdx = Math.max(0, history.size() - maxMessages);
 
         return history.subList(startIdx, history.size()).stream()
@@ -435,22 +853,13 @@ public class RagAnswerService {
     }
 
     private List<Map<String, Object>> summarizeRetrieval(RagRetrievalResult retrieval) {
-        if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) {
-            return List.of();
-        }
+        if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) return List.of();
 
         return retrieval.documents().stream()
                 .map(sd -> {
                     var doc = sd.document();
                     String content = doc.getContent();
-                    String preview;
-                    if (content == null) {
-                        preview = "";
-                    } else if (content.length() > 200) {
-                        preview = content.substring(0, 200) + "...";
-                    } else {
-                        preview = content;
-                    }
+                    String preview = (content == null) ? "" : (content.length() > 200 ? content.substring(0, 200) + "..." : content);
 
                     return Map.<String, Object>of(
                             "id", doc.getId(),
@@ -463,9 +872,7 @@ public class RagAnswerService {
     }
 
     private boolean isOutOfScope(RagRetrievalResult retrieval) {
-        if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) {
-            return true;
-        }
+        if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) return true;
 
         double topScore = retrieval.documents().stream()
                 .mapToDouble(ScoredDocument::score)
@@ -475,10 +882,13 @@ public class RagAnswerService {
         return topScore < MIN_KB_SCORE_FOR_ANSWER;
     }
 
-    private List<QaCandidate> extractQaCandidates(RagRetrievalResult retrieval) {
-        if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) {
-            return List.of();
-        }
+    /**
+     * Extract BOTH QA question + answer (if possible) and compute matchScore vs user question keywords.
+     */
+    private List<QaCandidate> extractQaCandidates(RagRetrievalResult retrieval, String userQuestion) {
+        if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) return List.of();
+
+        List<String> userKeywords = extractKeywords(userQuestion);
 
         List<ScoredDocument> sorted = retrieval.documents().stream()
                 .sorted(Comparator.comparingDouble(ScoredDocument::score).reversed())
@@ -486,9 +896,7 @@ public class RagAnswerService {
 
         List<QaCandidate> out = new ArrayList<>();
         for (ScoredDocument sd : sorted) {
-            if (sd == null || sd.document() == null) {
-                continue;
-            }
+            if (sd == null || sd.document() == null) continue;
 
             var doc = sd.document();
             String type = Optional.ofNullable(doc.getDocType()).orElse("");
@@ -499,70 +907,77 @@ public class RagAnswerService {
                             || content.contains("【回答】")
                             || content.toLowerCase().contains("answer:");
 
-            if (!looksQa) {
-                continue;
-            }
+            if (!looksQa) continue;
 
-            Optional<String> ans = extractQaAnswer(content);
-            if (ans.isEmpty()) {
-                continue;
-            }
+            Optional<String> ansOpt = extractQaAnswer(content);
+            if (ansOpt.isEmpty()) continue;
 
-            String a = ans.get().trim();
-            if (a.equals(OUT_OF_SCOPE_REPLY)) {
-                continue; // do not treat fallback as evidence
-            }
+            String a = ansOpt.get().trim();
+            if (a.equals(OUT_OF_SCOPE_REPLY)) continue;
+
+            String q = extractQaQuestion(content).orElse("").trim();
+
+            String matchText = !q.isBlank() ? q : a;
+            int matchScore = scoreChunk(matchText, userKeywords);
 
             out.add(new QaCandidate(
                     String.valueOf(doc.getId()),
                     type,
                     sd.score(),
+                    matchScore,
+                    truncate(q, 260),
                     truncate(a, 400)
             ));
 
-            if (out.size() >= MAX_QA_CANDIDATES) {
-                break;
-            }
+            if (out.size() >= MAX_QA_CANDIDATES) break;
         }
 
         return out;
     }
 
     private Optional<String> extractQaAnswer(String content) {
-        if (content == null) {
-            return Optional.empty();
-        }
+        if (content == null) return Optional.empty();
 
-        // Chinese marker: 【回答】 ... (until next 【...】 or end)
         Pattern zh = Pattern.compile("【回答】\\s*([\\s\\S]*?)(?:\\n\\s*【|\\z)");
         Matcher m1 = zh.matcher(content);
         if (m1.find()) {
             String ans = m1.group(1);
-            if (ans != null && !ans.trim().isBlank()) {
-                return Optional.of(ans.trim());
-            }
+            if (ans != null && !ans.trim().isBlank()) return Optional.of(ans.trim());
         }
 
-        // English marker: Answer: ... / A: ...
         Pattern en = Pattern.compile("(?i)(?:^|\\n)\\s*(?:answer\\s*:|a\\s*: )\\s*([\\s\\S]*?)(?:\\n\\s*(?:question\\s*:|q\\s*:|context\\s*:)|\\z)");
         Matcher m2 = en.matcher(content);
         if (m2.find()) {
             String ans = m2.group(1);
-            if (ans != null && !ans.trim().isBlank()) {
-                return Optional.of(ans.trim());
-            }
+            if (ans != null && !ans.trim().isBlank()) return Optional.of(ans.trim());
+        }
+
+        return Optional.empty();
+    }
+
+    private Optional<String> extractQaQuestion(String content) {
+        if (content == null) return Optional.empty();
+
+        Pattern zhQ = Pattern.compile("【(?:问题|提问)】\\s*([\\s\\S]*?)(?:\\n\\s*【|\\z)");
+        Matcher m1 = zhQ.matcher(content);
+        if (m1.find()) {
+            String q = m1.group(1);
+            if (q != null && !q.trim().isBlank()) return Optional.of(q.trim());
+        }
+
+        Pattern enQ = Pattern.compile("(?i)(?:^|\\n)\\s*(?:question\\s*:|q\\s*: )\\s*([\\s\\S]*?)(?:\\n\\s*(?:answer\\s*:|a\\s*:|context\\s*:)|\\z)");
+        Matcher m2 = enQ.matcher(content);
+        if (m2.find()) {
+            String q = m2.group(1);
+            if (q != null && !q.trim().isBlank()) return Optional.of(q.trim());
         }
 
         return Optional.empty();
     }
 
     private String truncate(String s, int maxChars) {
-        if (s == null) {
-            return "";
-        }
-        if (s.length() <= maxChars) {
-            return s;
-        }
+        if (s == null) return "";
+        if (s.length() <= maxChars) return s;
         return s.substring(0, maxChars) + "...";
     }
 
@@ -570,7 +985,7 @@ public class RagAnswerService {
         return Math.round(v * 1000.0) / 1000.0;
     }
 
-    private record QaCandidate(String id, String type, double score, String answer) {}
+    private record QaCandidate(String id, String type, double score, int matchScore, String question, String answer) {}
 
     private void safeLogOnce(
             String sessionId,
@@ -599,6 +1014,21 @@ public class RagAnswerService {
                     error,
                     retrieval
             );
+
+            RagRunEvent evt = RagRunEvent.from(
+                    sessionId,
+                    question,
+                    model,
+                    topK,
+                    minScore,
+                    promptText,
+                    answerText,
+                    latencyMs,
+                    outOfScope,
+                    error,
+                    retrieval
+            );
+            logIngestionClient.ingestAsync(evt);
         } catch (Exception ignored) {
             // Logging must never break answering
         }
