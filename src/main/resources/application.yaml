@@ -83,6 +83,21 @@ spring:
     #     # 这里一般保持默认即可
     #     ...
 
+# === Qwen3-VL-Flash (OpenAI-compatible) ===
+qwen:
+  # Singapore endpoint (default)
+  endpoint: https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions
+  # Beijing endpoint (uncomment to switch)
+  # endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+
+  api-key: ${DASHSCOPE_API_KEY}
+  model: qwen3-vl-flash
+
+  # OCR/文档解析通常不需要“思考模式”，默认 false（更快更省钱）
+  enable-thinking: false
+  temperature: 0.1
+  max-tokens: 2048
+
 # === Swagger UI / OpenAPI 文档 ===
 springdoc:
   swagger-ui:
