@@ -80,6 +80,9 @@ public class RagAnswerService {
 
     private static final ObjectMapper OM = new ObjectMapper();
 
+    private record FileInsights(List<String> queryKeywords, List<String> progressKeywords, String promptContext, String promptExcerpt) {
+    }
+
     /**
      * Low-token, accuracy-first system prompt (fixes “everything out-of-scope”):
      * - Yuqi-specific/private facts MUST be grounded in CTX/FILE/HIS
@@ -132,10 +135,11 @@ public class RagAnswerService {
 
         // 3) Build file context for prompt (budgeted)
         List<ExtractedFile> files = (attach == null) ? List.of() : safeList(attach.files());
-        String fileText = buildFileContext(request.question(), files);
+        FileInsights fileInsights = summarizeFileInsights(request.question(), files);
+        String fileText = fileInsights.promptContext();
 
         // 4) Use file keywords to refine retrieval (only when needed)
-        List<String> fileKeywords = extractFileKeywords(files, MAX_FILE_QUERY_KEYWORDS);
+        List<String> fileKeywords = fileInsights.queryKeywords();
         if (shouldRefineRetrieval(retrieval, fileKeywords)) {
             String expandedQuery = buildExpandedRetrievalQuery(request.question(), fileKeywords);
             if (!expandedQuery.equals(request.question())) {
@@ -326,8 +330,9 @@ public class RagAnswerService {
             if (fs.isEmpty()) return Flux.just(new ThinkingEvent("file_extract", "Extracted", Map.of("count", 0)));
 
             // Emit keywords + small relevant excerpt for frontend progress display
-            List<String> kws = extractFileKeywords(fs, PROGRESS_KEYWORDS);
-            String excerpts = truncate(buildFileContext(request.question(), fs), PROGRESS_EXCERPT_CHARS);
+            FileInsights fileInsights = summarizeFileInsights(request.question(), fs);
+            List<String> kws = fileInsights.progressKeywords();
+            String excerpts = fileInsights.promptExcerpt();
 
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("files", summarizeFilesExtracted(fs));
@@ -355,7 +360,8 @@ public class RagAnswerService {
                             retrievalRef.set(retrieval);
 
                             List<ExtractedFile> files = (attach == null) ? List.of() : safeList(attach.files());
-                            String fileText = buildFileContext(request.question(), files);
+                            FileInsights fileInsightsLocal = summarizeFileInsights(request.question(), files);
+                            String fileText = fileInsightsLocal.promptContext();
 
                             boolean outOfScopeKb = isOutOfScope(retrieval);
                             boolean hasAnyRef = hasAnyReference(retrieval, fileText);
@@ -473,7 +479,8 @@ public class RagAnswerService {
                     AttachmentContext ac = tuple.getT2();
                     List<ExtractedFile> files = (ac == null) ? List.of() : safeList(ac.files());
 
-                    String fileText = buildFileContext(request.question(), files);
+                    FileInsights fileInsights = summarizeFileInsights(request.question(), files);
+                    String fileText = fileInsights.promptContext();
                     boolean outOfScopeKb = isOutOfScope(retrieval);
                     boolean hasAnyRef = hasAnyReference(retrieval, fileText);
 
@@ -507,6 +514,16 @@ public class RagAnswerService {
         }
 
         return q + "\nFile keywords: " + joined;
+    }
+
+    private FileInsights summarizeFileInsights(String question, List<ExtractedFile> files) {
+        List<ExtractedFile> safeFiles = safeList(files);
+        List<String> queryKeywords = extractFileKeywords(safeFiles, MAX_FILE_QUERY_KEYWORDS);
+        List<String> progressKeywords = extractFileKeywords(safeFiles, PROGRESS_KEYWORDS);
+        String fileContext = buildFileContext(question, safeFiles, queryKeywords);
+        String excerpt = truncate(fileContext, PROGRESS_EXCERPT_CHARS);
+
+        return new FileInsights(queryKeywords, progressKeywords, fileContext, excerpt);
     }
 
     /**
@@ -723,11 +740,21 @@ public class RagAnswerService {
         return "LOW";
     }
 
-    private String buildFileContext(String question, List<ExtractedFile> files) {
+    private String buildFileContext(String question, List<ExtractedFile> files, List<String> fileKeywordsForScoring) {
         if (files == null || files.isEmpty()) return "";
 
-        List<String> keywords = extractKeywords(question);
-        if (keywords.isEmpty()) keywords = List.of();
+        List<String> questionKeywords = extractKeywords(question);
+        if (questionKeywords.isEmpty()) questionKeywords = List.of();
+
+        List<String> scoringKeywords = new ArrayList<>(questionKeywords);
+        if (fileKeywordsForScoring != null) {
+            for (String kw : fileKeywordsForScoring) {
+                if (kw == null || kw.isBlank()) continue;
+                if (!scoringKeywords.contains(kw)) {
+                    scoringKeywords.add(kw);
+                }
+            }
+        }
 
         record Chunk(String fileName, String mime, String text, int score) {}
         List<Chunk> chunks = new ArrayList<>();
@@ -741,7 +768,7 @@ public class RagAnswerService {
 
             List<String> pieceList = chunk(text, FILE_CHUNK_SIZE, FILE_CHUNK_OVERLAP);
             for (String piece : pieceList) {
-                int score = scoreChunk(piece, keywords);
+                int score = scoreChunk(piece, scoringKeywords);
                 chunks.add(new Chunk(
                         safe(f.filename(), "file"),
                         safe(f.mimeType(), "application/octet-stream"),
@@ -756,6 +783,11 @@ public class RagAnswerService {
         chunks.sort((a, b) -> Integer.compare(b.score(), a.score()));
 
         StringBuilder sb = new StringBuilder();
+        if (fileKeywordsForScoring != null && !fileKeywordsForScoring.isEmpty()) {
+            sb.append("File keywords: ")
+                    .append(String.join(", ", fileKeywordsForScoring))
+                    .append("\n\n");
+        }
         sb.append("Relevant excerpts:\n");
 
         int used = 0;
