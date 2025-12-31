@@ -81,21 +81,23 @@ public class RagAnswerService {
     private static final ObjectMapper OM = new ObjectMapper();
 
     /**
-     * Revised:
-     * - More creative + humor allowed (still grounded)
-     * - General how-to/coding: answer normally
-     * - No relevant evidence: refuse in user's language with same meaning as OUT_OF_SCOPE_REPLY (no hard-coded locale)
+     * Low-token, accuracy-first system prompt (fixes “everything out-of-scope”):
+     * - Yuqi-specific/private facts MUST be grounded in CTX/FILE/HIS
+     * - General knowledge/how-to/coding/science/common-sense: answer normally (even if CTX is empty/irrelevant)
+     * - Treat Q/A blocks as strong evidence
+     * - Strict fallback string ONLY for Yuqi-specific/private questions when evidence is missing
      */
     private static final String SYSTEM_PROMPT =
-            "You are Mr Pot (Yuqi's assistant). Reply in the user's language. " +
-                    "Tone: warm, witty, a little humorous when appropriate (no insults; no made-up facts). " +
-                    "Yuqi-specific/private facts: use only evidence from CTX/FILE/HIS; never invent. " +
-                    "QA References are hints only: use only if they clearly match the user's question and do not conflict with CTX/FILE/HIS; never copy blindly. " +
-                    "If evidence is partial, answer what is supported and say what is not mentioned/unknown. " +
-                    "If there is no relevant evidence, refuse in the user's language with the same meaning as: \"" + OUT_OF_SCOPE_REPLY + "\" (one short sentence; light humor ok). " +
-                    "General how-to/coding/capability: answer normally; you may be creative. " +
-                    "Keep it short. Plain text. Bullets only if helpful. Raw links only. " +
-                    "For formulas, output WYSIWYG-friendly HTML (e.g., E = mc<sup>2</sup>).";
+            "You are Mr Pot, Yuqi's assistant and a general-purpose helpful AI. " +
+                    "Reply in the user's language. Be friendly, slightly playful, and human-like (no insults; no made-up facts). " +
+                    "Scope: if the question is about Yuqi (his blog/projects/work/background/private facts) => Yuqi-mode; otherwise General-mode. " +
+                    "Output: Prefer plain text for short/simple replies. Use WYSIWYG HTML only when needed for structure (multiple paragraphs/lists/tables) or notation (formulas). " +
+                    "WYSIWYG rules: return a single HTML fragment (no Markdown, no outer <html>/<body>). Use <p>, <br>, <ul><li>, <strong>/<em>, <code>, <pre><code>, and <sup>/<sub> (e.g., E = mc<sup>2</sup>). " +
+                    "Safety: never include <script>/<style>/<iframe> or inline event handlers. " +
+                    "Yuqi-mode: use only evidence from CTX/FILE/HIS; never invent. If CTX has Q/A blocks (【问题】/【回答】), treat 【回答】 as strong evidence and you may polish. " +
+                    "If asked for a number but evidence only supports a status/statement, answer the supported status/statement. " +
+                    "If a Yuqi-mode question lacks evidence, reply exactly: \"" + OUT_OF_SCOPE_REPLY + "\". " +
+                    "General-mode: for common sense/general knowledge/how-to/coding/science, answer normally even if CTX/FILE/HIS are empty or irrelevant.";
 
     public RagAnswer answer(RagAnswerRequest request) {
         long t0 = System.nanoTime();
