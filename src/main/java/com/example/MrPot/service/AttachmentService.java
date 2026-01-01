@@ -14,8 +14,12 @@ import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.*;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
@@ -26,8 +30,6 @@ public class AttachmentService {
     private final QwenVlFlashClient qwenVlClient;
     private final UrlFileDownloader downloader;
 
-    private static final String MODEL = System.getenv().getOrDefault("QWEN_VL_MODEL", "qwen3-vl-flash");
-
     private static final Duration HEAD_TIMEOUT = Duration.ofSeconds(6);
     private static final Duration DL_TIMEOUT = Duration.ofSeconds(25);
 
@@ -35,65 +37,76 @@ public class AttachmentService {
     private static final int PDF_DPI = 150;
 
     public DocumentUnderstandingResult understandFileUrlWithQwenVl(String fileUrl) {
-        // 1) 尝试 HEAD 快速判断类型（失败就靠后缀/下载的 content-type）
         String mime = downloader.headContentType(fileUrl, HEAD_TIMEOUT).block();
         mime = normalizeMime(mime);
 
-        List<Map<String, Object>> contentParts = new ArrayList<>();
+        try {
+            if (isImage(mime, fileUrl)) {
+                // Prefer passing URL directly; if provider can't fetch, fallback to data: URI (download bytes).
+                DocumentUnderstandingResult r1 = callQwenWithParts(List.of(
+                        imageUrlPart(fileUrl),
+                        textPart(buildExtractionPrompt("image"))
+                ));
+                if (!isEmptyKeyInfo(r1)) return r1;
 
-        // 2) 统一：Qwen 无法访问 URL，因此 image/pdf/text 都必须先下载
-        if (isImage(mime, fileUrl)) {
-            UrlFileDownloader.DownloadedFile f = downloader.download(fileUrl, DL_TIMEOUT).block();
-            if (f == null || f.bytes() == null || f.bytes().length == 0) {
-                return fallbackResult("download_failed: image");
+                UrlFileDownloader.DownloadedFile f = downloader.download(fileUrl, DL_TIMEOUT).block();
+                if (f == null || f.bytes() == null || f.bytes().length == 0) return fallbackResult("download_failed: image");
+
+                String imgMime = normalizeMime(f.contentType());
+                if (imgMime == null || imgMime.isBlank() || !imgMime.startsWith("image/")) imgMime = guessImageMimeFromUrl(fileUrl);
+
+                String dataUri = toDataUri(imgMime, f.bytes());
+                return callQwenWithParts(List.of(
+                        imageUrlPart(dataUri),
+                        textPart(buildExtractionPrompt("image"))
+                ));
             }
 
-            String imgMime = normalizeMime(f.contentType());
-            if (imgMime == null || imgMime.isBlank() || !imgMime.startsWith("image/")) {
-                imgMime = guessImageMimeFromUrl(fileUrl);
+            if (isPdf(mime, fileUrl)) {
+                UrlFileDownloader.DownloadedFile f = downloader.download(fileUrl, DL_TIMEOUT).block();
+                if (f == null || f.bytes() == null || f.bytes().length == 0) return fallbackResult("download_failed: pdf");
+
+                List<String> pageDataUris = renderPdfFirstPagesToPngDataUri(f.bytes(), MAX_PDF_PAGES, PDF_DPI);
+                if (pageDataUris.isEmpty()) return fallbackResult("pdf_render_failed");
+
+                List<Map<String, Object>> parts = new ArrayList<>();
+                for (String du : pageDataUris) parts.add(imageUrlPart(du));
+                parts.add(textPart(buildExtractionPrompt("pdf")));
+                return callQwenWithParts(parts);
             }
 
-            String dataUri = toDataUri(imgMime, f.bytes());
-            contentParts.add(imageDataUriPart(dataUri));
-            contentParts.add(textPart(buildExtractionPrompt("image")));
+            if (isText(mime, fileUrl)) {
+                UrlFileDownloader.DownloadedFile f = downloader.download(fileUrl, DL_TIMEOUT).block();
+                if (f == null || f.bytes() == null || f.bytes().length == 0) return fallbackResult("download_failed: text");
 
-        } else if (isPdf(mime, fileUrl)) {
-            UrlFileDownloader.DownloadedFile f = downloader.download(fileUrl, DL_TIMEOUT).block();
-            if (f == null || f.bytes() == null || f.bytes().length == 0) {
-                return fallbackResult("download_failed: pdf");
+                String text = new String(f.bytes(), StandardCharsets.UTF_8);
+                return callQwenWithParts(List.of(
+                        textPart(buildExtractionPrompt("text") + "\nFILE_TEXT:\n" + truncate(text, 12000))
+                ));
             }
 
-            List<String> pageDataUris = renderPdfFirstPagesToPngDataUri(f.bytes(), MAX_PDF_PAGES, PDF_DPI);
-            if (pageDataUris.isEmpty()) {
-                return fallbackResult("pdf_render_failed");
-            }
+            String note = "unsupported_type: " + (mime == null ? "unknown" : mime);
+            return callQwenWithParts(List.of(
+                    textPart(buildExtractionPrompt("binary") + "\n" + note + "\nurl=" + fileUrl)
+            ));
 
-            for (String dataUri : pageDataUris) {
-                contentParts.add(imageDataUriPart(dataUri));
-            }
-            contentParts.add(textPart(buildExtractionPrompt("pdf") + "\nqwenvl markdown"));
-
-        } else if (isText(mime, fileUrl)) {
-            UrlFileDownloader.DownloadedFile f = downloader.download(fileUrl, DL_TIMEOUT).block();
-            if (f == null || f.bytes() == null || f.bytes().length == 0) {
-                return fallbackResult("download_failed: text");
-            }
-            String text = new String(f.bytes(), StandardCharsets.UTF_8);
-            contentParts.add(textPart(buildExtractionPrompt("text") + "\nFILE_TEXT:\n" + truncate(text, 12000)));
-
-        } else {
-            // docx/pptx 等：如果你坚持“VL only”，需要先转 PDF 再渲染成图片（这里不实现转换，只给可诊断输出）
-            String note = "unsupported_type_for_vl_pipeline: " + (mime == null ? "unknown" : mime);
-            contentParts.add(textPart(buildExtractionPrompt("binary") + "\n" + note + "\nurl=" + fileUrl));
+        } catch (Exception e) {
+            return fallbackResult("extract_failed: " + e.getClass().getSimpleName() + ": " + (e.getMessage() == null ? "" : e.getMessage()));
         }
+    }
 
+    private DocumentUnderstandingResult callQwenWithParts(List<Map<String, Object>> contentParts) {
         Map<String, Object> userMsg = new LinkedHashMap<>();
         userMsg.put("role", "user");
         userMsg.put("content", contentParts);
 
-        Map<String, Object> extra = Map.of("enable_thinking", false);
+        // Align with DashScope UI-ish defaults
+        Map<String, Object> extra = new LinkedHashMap<>();
+        extra.put("temperature", 0.7);
+        extra.put("top_p", 0.8);
+        extra.put("max_tokens", 256);
 
-        String raw = qwenVlClient.chatCompletions(MODEL, List.of(userMsg), extra);
+        String raw = qwenVlClient.chatCompletions(null, List.of(userMsg), extra);
         return parseUnderstandingOrFallback(raw);
     }
 
@@ -101,9 +114,9 @@ public class AttachmentService {
 
     private String buildExtractionPrompt(String kind) {
         return """
-Extract key info for KB retrieval. Type=%s.
-Return ONLY JSON: {"text":"<=1200 chars","keywords":["<=20"],"queries":["<=8"]}"""
-                .formatted(kind);
+Extract key info from %s.
+JSON only: {"text":"","keywords":[],"queries":[]}  text max 60 chars; keywords max 10; queries max 1. Do not echo limits.
+""".formatted(kind);
     }
 
     // ---------------- Parse (never empty) ----------------
@@ -127,6 +140,14 @@ Return ONLY JSON: {"text":"<=1200 chars","keywords":["<=20"],"queries":["<=8"]}"
         if (r.getKeywords() == null) r.setKeywords(List.of());
         if (r.getQueries() == null) r.setQueries(List.of());
         return r;
+    }
+
+    private boolean isEmptyKeyInfo(DocumentUnderstandingResult r) {
+        if (r == null) return true;
+        String t = r.getText() == null ? "" : r.getText().trim();
+        return t.isBlank()
+                && (r.getKeywords() == null || r.getKeywords().isEmpty())
+                && (r.getQueries() == null || r.getQueries().isEmpty());
     }
 
     private DocumentUnderstandingResult fallbackResult(String text) {
@@ -194,8 +215,8 @@ Return ONLY JSON: {"text":"<=1200 chars","keywords":["<=20"],"queries":["<=8"]}"
         return Map.of("type", "text", "text", text);
     }
 
-    private Map<String, Object> imageDataUriPart(String dataUri) {
-        return Map.of("type", "image_url", "image_url", Map.of("url", dataUri));
+    private Map<String, Object> imageUrlPart(String urlOrDataUri) {
+        return Map.of("type", "image_url", "image_url", Map.of("url", urlOrDataUri));
     }
 
     // ---------------- Helpers ----------------

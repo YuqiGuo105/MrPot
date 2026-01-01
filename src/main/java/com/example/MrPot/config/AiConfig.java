@@ -56,7 +56,7 @@ public class AiConfig {
         return ChatClient.builder(model)
                 .defaultSystem("You're Mr Pot, Yuqi's LLM Agent")
                 .defaultOptions(DashScopeChatOptions.builder()
-                        .model("qwen3-vl-flash")
+                        .model("qwen-vl-plus")
                         .build())
                 .build();
     }
