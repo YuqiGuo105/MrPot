@@ -73,6 +73,14 @@ public class RagRetrievalService {
      *         - formatted context string for LLM
      */
     public RagRetrievalResult retrieve(RagQueryRequest request) {
+        // Defensive: if the question is missing/blank (e.g., file-only uploads),
+        // skip embedding and return an empty retrieval result so callers can
+        // decide whether to expand the query using extracted file keywords.
+        if (request == null || request.question() == null || request.question().isBlank()) {
+            log.debug("RAG retrieval: empty question provided; skipping vector search");
+            return new RagRetrievalResult("", List.of(), "(empty question)");
+        }
+
         // 1. Get user question
         String question = request.question();
 
