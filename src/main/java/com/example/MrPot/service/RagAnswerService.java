@@ -2,6 +2,7 @@ package com.example.MrPot.service;
 
 import com.example.MrPot.model.*;
 import com.example.MrPot.service.dto.DocumentUnderstandingResult;
+import com.example.MrPot.service.dto.FileContentData;
 import com.example.MrPot.tools.ToolProfile;
 import com.example.MrPot.tools.ToolRegistry;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -28,7 +29,7 @@ public class RagAnswerService {
     private final RedisChatMemoryService chatMemoryService;
     private final Map<String, ChatClient> chatClients;
     private final ToolRegistry toolRegistry;
-    private final QwenVlFlashClient qwenVlFlashClient;
+    private final RemoteOcrFileEnricher remoteOcrFileEnricher;
 
     // --- Minimal analytics logger (2-table design) ---
     private final RagRunLogger runLogger;
@@ -86,9 +87,6 @@ public class RagAnswerService {
     private record FileInsights(List<String> queryKeywords, List<String> progressKeywords, String promptContext, String promptExcerpt) {
     }
 
-    private record FileContentData(ExtractedFile file, String text, List<String> keywords) {
-    }
-
     /**
      * Low-token, accuracy-first system prompt (fixes “everything out-of-scope”):
      * - Yuqi-specific/private facts MUST be grounded in CTX/FILE/HIS
@@ -141,7 +139,7 @@ public class RagAnswerService {
 
         // 3) Build file context for prompt (budgeted)
         List<FileContentData> files = normalizeFileContents(attach == null ? List.of() : safeList(attach.files()));
-        files = augmentWithRemoteOcr(urls, files);
+        files = remoteOcrFileEnricher.enrich(urls, files, ATTACH_TIMEOUT);
         FileInsights fileInsights = summarizeFileInsights(request.question(), files);
         String fileText = fileInsights.promptContext();
 
@@ -297,7 +295,7 @@ public class RagAnswerService {
                             AttachmentContext ac = tuple.getT2();
 
                             List<FileContentData> files = normalizeFileContents(ac == null ? List.of() : safeList(ac.files()));
-                            files = augmentWithRemoteOcr(urls, files);
+                            files = remoteOcrFileEnricher.enrich(urls, files, ATTACH_TIMEOUT);
                             List<String> fileKeywords = extractFileKeywords(files, MAX_FILE_QUERY_KEYWORDS);
 
                             if (!shouldRefineRetrieval(r0, fileKeywords)) return Mono.just(r0);
@@ -328,7 +326,7 @@ public class RagAnswerService {
         Flux<ThinkingEvent> fileFetchStep = attachMono.flatMapMany(ctx -> {
             if (urls.isEmpty()) return Flux.empty();
             List<FileContentData> fs = normalizeFileContents(ctx == null ? List.of() : safeList(ctx.files()));
-            fs = augmentWithRemoteOcr(urls, fs);
+            fs = remoteOcrFileEnricher.enrich(urls, fs, ATTACH_TIMEOUT);
             if (fs.isEmpty()) return Flux.just(new ThinkingEvent("file_fetch", "Fetched", Map.of("count", 0)));
             return Flux.just(new ThinkingEvent("file_fetch", "Fetched", summarizeFilesFetched(fs)));
         });
@@ -336,7 +334,7 @@ public class RagAnswerService {
         Flux<ThinkingEvent> fileExtractStep = attachMono.flatMapMany(ctx -> {
             if (urls.isEmpty()) return Flux.empty();
             List<FileContentData> fs = normalizeFileContents(ctx == null ? List.of() : safeList(ctx.files()));
-            fs = augmentWithRemoteOcr(urls, fs);
+            fs = remoteOcrFileEnricher.enrich(urls, fs, ATTACH_TIMEOUT);
             if (fs.isEmpty()) return Flux.just(new ThinkingEvent("file_extract", "Extracted", Map.of("count", 0)));
 
             // Emit keywords + small relevant excerpt for frontend progress display
@@ -370,7 +368,7 @@ public class RagAnswerService {
                             retrievalRef.set(retrieval);
 
                             List<FileContentData> files = normalizeFileContents(attach == null ? List.of() : safeList(attach.files()));
-                            files = augmentWithRemoteOcr(urls, files);
+                            files = remoteOcrFileEnricher.enrich(urls, files, ATTACH_TIMEOUT);
                             FileInsights fileInsightsLocal = summarizeFileInsights(request.question(), files);
                             String fileText = fileInsightsLocal.promptContext();
 
@@ -471,7 +469,7 @@ public class RagAnswerService {
                             AttachmentContext ac = tuple.getT2();
 
                             List<FileContentData> files = normalizeFileContents(ac == null ? List.of() : safeList(ac.files()));
-                            files = augmentWithRemoteOcr(urls, files);
+                            files = remoteOcrFileEnricher.enrich(urls, files, ATTACH_TIMEOUT);
                             List<String> fileKeywords = extractFileKeywords(files, MAX_FILE_QUERY_KEYWORDS);
 
                             if (!shouldRefineRetrieval(r0, fileKeywords)) return Mono.just(r0);
@@ -490,7 +488,7 @@ public class RagAnswerService {
                     RagRetrievalResult retrieval = tuple.getT1();
                     AttachmentContext ac = tuple.getT2();
                     List<FileContentData> files = normalizeFileContents(ac == null ? List.of() : safeList(ac.files()));
-                    files = augmentWithRemoteOcr(urls, files);
+                    files = remoteOcrFileEnricher.enrich(urls, files, ATTACH_TIMEOUT);
 
                     FileInsights fileInsights = summarizeFileInsights(request.question(), files);
                     String fileText = fileInsights.promptContext();
@@ -555,17 +553,17 @@ public class RagAnswerService {
         int totalTokenCount = 0;
 
         for (FileContentData f : files) {
-            if (f == null || f.file() == null) continue;
-            if (f.file().error() != null && !f.file().error().isBlank()) continue;
+            if (f == null || f.getFile() == null) continue;
+            if (f.getFile().error() != null && !f.getFile().error().isBlank()) continue;
 
             // 1) Explicit keywords from model outputs (boosted highest)
-            for (String kw : safeList(f.keywords())) {
+            for (String kw : safeList(f.getKeywords())) {
                 String normalized = normalizeKeyword(kw);
                 if (!isNoiseToken(normalized)) bump(freq, normalized, 4);
             }
 
             // 2) Filename tokens (boosted)
-            String filename = Optional.ofNullable(f.file().filename()).orElse("");
+            String filename = Optional.ofNullable(f.getFile().filename()).orElse("");
             if (!filename.isBlank()) {
                 for (String part : filename.split("[^\\p{L}\\p{N}]+")) {
                     String kw = normalizeKeyword(part);
@@ -574,7 +572,7 @@ public class RagAnswerService {
             }
 
             // 3) Text tokens (budgeted)
-            String text = Optional.ofNullable(f.text()).orElse("");
+            String text = Optional.ofNullable(f.getText()).orElse("");
             if (text.isBlank()) continue;
 
             String scan = text.length() > 5000 ? text.substring(0, 5000) : text;
@@ -677,78 +675,6 @@ public class RagAnswerService {
         return list.stream().filter(Objects::nonNull).toList();
     }
 
-    private List<FileContentData> augmentWithRemoteOcr(List<String> urls, List<FileContentData> baseFiles) {
-        List<FileContentData> base = safeList(baseFiles);
-        if (urls == null || urls.isEmpty()) return base;
-
-        Map<String, FileContentData> byUrl = new LinkedHashMap<>();
-        for (FileContentData f : base) {
-            if (f == null || f.file() == null || f.file().uri() == null) continue;
-            byUrl.put(f.file().uri().toString(), f);
-        }
-
-        List<FileContentData> merged = new ArrayList<>(base);
-        for (String url : urls) {
-            if (url == null || url.isBlank()) continue;
-            try {
-                DocumentUnderstandingResult result = qwenVlFlashClient
-                        .understandPublicUrlWithKeywords(url, null)
-                        .block(ATTACH_TIMEOUT);
-                if (result == null) continue;
-
-                String text = Optional.ofNullable(result.getText()).orElse("");
-                List<String> kws = safeList(result.getKeywords());
-                if (text.isBlank() && kws.isEmpty()) continue;
-
-                FileContentData existing = byUrl.get(url);
-                if (existing != null) {
-                    String combinedText = combineText(existing.text(), text);
-                    List<String> combinedKeywords = mergeKeywords(existing.keywords(), kws);
-                    FileContentData updated = new FileContentData(existing.file(), combinedText, combinedKeywords);
-                    merged.remove(existing);
-                    merged.add(updated);
-                    byUrl.put(url, updated);
-                } else {
-                    ExtractedFile synthetic = new ExtractedFile(
-                            URI.create(url),
-                            "remote-file",
-                            "image/remote-url",
-                            0L,
-                            text,
-                            null
-                    );
-                    FileContentData added = new FileContentData(synthetic, text, kws);
-                    merged.add(added);
-                    byUrl.put(url, added);
-                }
-            } catch (Exception ignore) {
-                // Skip failures silently to avoid blocking the main answer flow.
-            }
-        }
-
-        return merged;
-    }
-
-    private static List<String> mergeKeywords(List<String> existing, List<String> extra) {
-        LinkedHashSet<String> merged = new LinkedHashSet<>();
-        for (String k : safeList(existing)) {
-            if (k != null && !k.isBlank()) merged.add(k);
-        }
-        for (String k : safeList(extra)) {
-            if (k != null && !k.isBlank()) merged.add(k);
-        }
-        return List.copyOf(merged);
-    }
-
-    private static String combineText(String original, String addition) {
-        String a = Optional.ofNullable(original).orElse("").trim();
-        String b = Optional.ofNullable(addition).orElse("").trim();
-        if (a.isBlank()) return b;
-        if (b.isBlank()) return a;
-        if (a.contains(b)) return a;
-        if (b.contains(a)) return b;
-        return a + "\n" + b;
-    }
 
     private List<FileContentData> normalizeFileContents(List<ExtractedFile> files) {
         List<ExtractedFile> safeFiles = safeList(files);
@@ -774,7 +700,11 @@ public class RagAnswerService {
                 }
             }
 
-            out.add(new FileContentData(f, text, kws));
+            out.add(FileContentData.builder()
+                    .file(f)
+                    .text(text)
+                    .keywords(kws)
+                    .build());
         }
 
         return out;
@@ -883,18 +813,18 @@ public class RagAnswerService {
         List<Chunk> chunks = new ArrayList<>();
 
         for (FileContentData f : files) {
-            if (f == null || f.file() == null) continue;
-            if (f.file().error() != null && !f.file().error().isBlank()) continue;
+            if (f == null || f.getFile() == null) continue;
+            if (f.getFile().error() != null && !f.getFile().error().isBlank()) continue;
 
-            String text = Optional.ofNullable(f.text()).orElse("").trim();
+            String text = Optional.ofNullable(f.getText()).orElse("").trim();
             if (text.isBlank()) continue;
 
             List<String> pieceList = chunk(text, FILE_CHUNK_SIZE, FILE_CHUNK_OVERLAP);
             for (String piece : pieceList) {
                 int score = scoreChunk(piece, scoringKeywords);
                 chunks.add(new Chunk(
-                        safe(f.file().filename(), "file"),
-                        safe(f.file().mimeType(), "application/octet-stream"),
+                        safe(f.getFile().filename(), "file"),
+                        safe(f.getFile().mimeType(), "application/octet-stream"),
                         piece,
                         score
                 ));
@@ -995,19 +925,19 @@ public class RagAnswerService {
 
     private List<Map<String, Object>> summarizeFilesFetched(List<FileContentData> files) {
         return files.stream().map(f -> Map.<String, Object>of(
-                "url", String.valueOf(f.file().uri()),
-                "name", safe(f.file().filename(), "file"),
-                "mime", safe(f.file().mimeType(), "application/octet-stream"),
-                "bytes", f.file().sizeBytes()
+                "url", String.valueOf(f.getFile().uri()),
+                "name", safe(f.getFile().filename(), "file"),
+                "mime", safe(f.getFile().mimeType(), "application/octet-stream"),
+                "bytes", f.getFile().sizeBytes()
         )).toList();
     }
 
     private List<Map<String, Object>> summarizeFilesExtracted(List<FileContentData> files) {
         return files.stream().map(f -> Map.<String, Object>of(
-                "name", safe(f.file().filename(), "file"),
-                "mime", safe(f.file().mimeType(), "application/octet-stream"),
-                "preview", truncate(Optional.ofNullable(f.text()).orElse(""), 400),
-                "error", Optional.ofNullable(f.file().error()).orElse("")
+                "name", safe(f.getFile().filename(), "file"),
+                "mime", safe(f.getFile().mimeType(), "application/octet-stream"),
+                "preview", truncate(Optional.ofNullable(f.getText()).orElse(""), 400),
+                "error", Optional.ofNullable(f.getFile().error()).orElse("")
         )).toList();
     }
 

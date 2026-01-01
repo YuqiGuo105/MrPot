@@ -107,12 +107,12 @@ public class QwenVlFlashClient {
         }
         // For document OCR/parsing, Qwen docs recommend prompts like "qwenvl markdown/html"
         // but if you only want plain text, ask for plain text explicitly.
-        return "Please perform OCR / document understanding on the image and return the most complete plain text possible. Preserve original paragraphs and line breaks, and do not add extra commentary.";
+        return "Please perform OCR / document understanding on the image. Return only the key content as plain text, preserving original paragraphs and line breaks, with no commentary or formatting beyond the source text.";
     }
 
     private String normalizePromptWithKeywords(String userPrompt) {
         String basePrompt = normalizePrompt(userPrompt);
-        return basePrompt + "\n请额外提取 3-8 个核心关键词，输出 JSON，如 {\"text\":\"...\",\"keywords\":[\"k1\",...]}。";
+        return basePrompt + "\nAlso extract 3-8 concise keywords. Respond with JSON only: {\"text\":\"...\",\"keywords\":[\"k1\",...]}.";
     }
 
     private Map<String, Object> buildRequestBody(String imageUrl, String prompt) {
