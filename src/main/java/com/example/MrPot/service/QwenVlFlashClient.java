@@ -1,163 +1,178 @@
 package com.example.MrPot.service;
 
-import com.example.MrPot.service.dto.DocumentUnderstandingResult;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
-import org.springframework.stereotype.Service;
-import org.springframework.web.reactive.function.client.WebClient;
-import reactor.core.publisher.Mono;
+import lombok.RequiredArgsConstructor;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.prompt.ChatOptions;
+import org.springframework.ai.content.Media;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.stereotype.Component;
+import org.springframework.util.MimeType;
 
-import java.io.IOException;
-import java.util.Base64;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.stream.Collectors;
+import java.net.URI;
+import java.util.*;
 
-/**
- * Minimal client for calling Qwen3-VL-Flash over the OpenAI-compatible endpoint.
- * Supports either public URLs or Base64 data URLs for OCR / document understanding.
- */
-@Service
+@Component
+@RequiredArgsConstructor
 public class QwenVlFlashClient {
 
-    private final WebClient webClient;
-    private final ObjectMapper objectMapper;
-
-    public QwenVlFlashClient(
-            @Value("${qwen.endpoint}") String endpoint,
-            @Value("${qwen.api-key}") String apiKey,
-            ObjectMapper objectMapper
-    ) {
-        this.webClient = WebClient.builder()
-                .baseUrl(endpoint)
-                .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
-                .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
-                .build();
-        this.objectMapper = objectMapper;
-    }
-
-    @Value("${qwen.model:qwen3-vl-flash}")
-    private String model;
-
-    @Value("${qwen.enable-thinking:false}")
-    private boolean enableThinking;
-
-    @Value("${qwen.temperature:0.1}")
-    private double temperature;
-
-    @Value("${qwen.max-tokens:2048}")
-    private int maxTokens;
+    private final @Qualifier("qwenChatClient") ChatClient qwenChatClient;
 
     /**
-     * OCR using public URL (recommended for large images or when you already have a public link).
+     * OpenAI-compatible input shape:
+     * messages: [{role: "system"|"user"|"assistant", content: "..." | [{type:"text",text:"..."},{type:"image_url",image_url:{url:"..."}}]}]
+     *
+     * extraBody: runtime overrides like temperature/top_p/top_k/max_tokens/stop, etc.
      */
-    public Mono<String> ocrByPublicUrl(String imageUrl, String userPrompt) {
-        return postAndExtract(buildRequestBody(imageUrl, normalizePrompt(userPrompt)));
+    public String chatCompletions(String model,
+                                  List<Map<String, Object>> messages,
+                                  Map<String, Object> extraBody) {
+
+        List<Message> springMessages = toSpringMessages(messages);
+        ChatOptions options = toChatOptions(model, extraBody);
+
+        return qwenChatClient.prompt()
+                .messages(springMessages)
+                .options(options)
+                .call()
+                .content();
     }
 
-    /**
-     * OCR + keyword extraction using public URL (recommended for large images or existing public links).
-     */
-    public Mono<DocumentUnderstandingResult> understandPublicUrlWithKeywords(String imageUrl, String userPrompt) {
-        String prompt = normalizePromptWithKeywords(userPrompt);
-        return postAndExtract(buildRequestBody(imageUrl, prompt))
-                .map(this::parseDocumentResult);
-    }
+    private static List<Message> toSpringMessages(List<Map<String, Object>> messages) {
+        if (messages == null || messages.isEmpty()) return List.of();
 
-    /**
-     * OCR using Base64 data URL (recommended for small images < 7MB).
-     */
-    public Mono<String> ocrByBase64(byte[] imageBytes, String mimeType, String userPrompt) {
-        String base64 = Base64.getEncoder().encodeToString(imageBytes);
-        String dataUrl = "data:" + mimeType + ";base64," + base64;
+        List<Message> out = new ArrayList<>();
 
-        return postAndExtract(buildRequestBody(dataUrl, normalizePrompt(userPrompt)));
-    }
+        for (Map<String, Object> m : messages) {
+            if (m == null) continue;
 
-    /**
-     * Understand uploaded images (Base64) and extract keywords along with the text content.
-     * Returns a structured result so callers don't have to parse model output themselves.
-     */
-    public Mono<DocumentUnderstandingResult> understandUploadWithKeywords(byte[] imageBytes, String mimeType, String userPrompt) {
-        String base64 = Base64.getEncoder().encodeToString(imageBytes);
-        String dataUrl = "data:" + mimeType + ";base64," + base64;
-        String prompt = normalizePromptWithKeywords(userPrompt);
+            String role = Objects.toString(m.get("role"), "user").trim();
+            Object content = m.get("content");
 
-        return postAndExtract(buildRequestBody(dataUrl, prompt))
-                .map(this::parseDocumentResult);
-    }
-
-    private Mono<String> postAndExtract(Map<String, Object> body) {
-        return webClient.post()
-                .bodyValue(body)
-                .retrieve()
-                .bodyToMono(JsonNode.class)
-                .map(json -> json.at("/choices/0/message/content").asText(""))
-                .onErrorResume(e -> Mono.error(new RuntimeException("Qwen-VL call failed: " + e.getMessage(), e)));
-    }
-
-    private String normalizePrompt(String userPrompt) {
-        if (userPrompt != null && !userPrompt.isBlank()) {
-            return userPrompt.trim();
-        }
-        // For document OCR/parsing, Qwen docs recommend prompts like "qwenvl markdown/html"
-        // but if you only want plain text, ask for plain text explicitly.
-        return "Please perform OCR / document understanding on the image. Return only the key content as plain text, preserving original paragraphs and line breaks, with no commentary or formatting beyond the source text.";
-    }
-
-    private String normalizePromptWithKeywords(String userPrompt) {
-        String basePrompt = normalizePrompt(userPrompt);
-        return basePrompt + "\nAlso extract 3-8 concise keywords. Respond with JSON only: {\"text\":\"...\",\"keywords\":[\"k1\",...]}.";
-    }
-
-    private Map<String, Object> buildRequestBody(String imageUrl, String prompt) {
-        return Map.of(
-                "model", model,
-                "temperature", temperature,
-                "max_tokens", maxTokens,
-                // Non-standard param supported by Qwen3-VL hybrid thinking models
-                "enable_thinking", enableThinking,
-                "messages", List.of(Map.of(
-                        "role", "user",
-                        "content", List.of(
-                                Map.of("type", "image_url", "image_url", Map.of("url", imageUrl)),
-                                Map.of("type", "text", "text", prompt)
-                        )
-                ))
-        );
-    }
-
-    private DocumentUnderstandingResult parseDocumentResult(String content) {
-        try {
-            return objectMapper.readValue(content, DocumentUnderstandingResult.class);
-        } catch (IOException ignore) {
-            // Model may return plain text; fall back to heuristic keyword extraction.
-            return DocumentUnderstandingResult.builder()
-                    .text(content)
-                    .keywords(extractKeywords(content))
-                    .build();
-        }
-    }
-
-    private List<String> extractKeywords(String content) {
-        Set<String> unique = new LinkedHashSet<>();
-        for (String token : content.split("\\W+")) {
-            String normalized = token.trim();
-            if (normalized.length() >= 2) {
-                unique.add(normalized);
+            // Plain string
+            if (content instanceof String s) {
+                out.add(toTextMessage(role, s));
+                continue;
             }
-            if (unique.size() >= 8) {
-                break;
+
+            // OpenAI multimodal array:
+            // [{"type":"text","text":"..."},{"type":"image_url","image_url":{"url":"..."}}]
+            if (content instanceof List<?> parts) {
+                ParsedParts parsed = parseOpenAiParts(parts);
+
+                if ("system".equals(role)) {
+                    out.add(new SystemMessage(parsed.text()));
+                } else if ("assistant".equals(role)) {
+                    out.add(new AssistantMessage(parsed.text()));
+                } else {
+                    // user with optional media
+                    out.add(UserMessage.builder()
+                            .text(parsed.text())
+                            .media(parsed.media())
+                            .build());
+                }
+                continue;
+            }
+
+            // Fallback
+            out.add(toTextMessage(role, String.valueOf(content)));
+        }
+
+        return out;
+    }
+
+    private static Message toTextMessage(String role, String text) {
+        return switch (role) {
+            case "system" -> new SystemMessage(text);
+            case "assistant" -> new AssistantMessage(text);
+            default -> new UserMessage(text);
+        };
+    }
+
+    private record ParsedParts(String text, List<Media> media) {}
+
+    @SuppressWarnings("unchecked")
+    private static ParsedParts parseOpenAiParts(List<?> parts) {
+        StringBuilder text = new StringBuilder();
+        List<Media> media = new ArrayList<>();
+
+        for (Object p : parts) {
+            if (!(p instanceof Map<?, ?> pm)) continue;
+
+            String type = Objects.toString(pm.get("type"), "");
+            if ("text".equals(type)) {
+                String t = Objects.toString(pm.get("text"), "");
+                if (!t.isBlank()) {
+                    if (!text.isEmpty()) text.append("\n");
+                    text.append(t);
+                }
+            } else if ("image_url".equals(type)) {
+                String url = extractImageUrl(pm.get("image_url"));
+                if (url != null && !url.isBlank()) {
+                    MimeType mt = guessImageMimeType(url);
+                    media.add(new Media(mt, URI.create(url)));
+                }
             }
         }
-        if (unique.isEmpty()) {
-            return List.of();
+
+        return new ParsedParts(text.toString(), media);
+    }
+
+    private static String extractImageUrl(Object imageUrlObj) {
+        if (imageUrlObj == null) return null;
+
+        // sometimes it's directly a string
+        if (imageUrlObj instanceof String s) return s;
+
+        // common: {"url":"..."}
+        if (imageUrlObj instanceof Map<?, ?> m) {
+            Object u = m.get("url");
+            return (u == null) ? null : String.valueOf(u);
         }
-        return unique.stream().limit(8).collect(Collectors.toList());
+
+        return String.valueOf(imageUrlObj);
+    }
+
+    private static MimeType guessImageMimeType(String url) {
+        String u = url.toLowerCase(Locale.ROOT);
+        if (u.endsWith(".png")) return Media.Format.IMAGE_PNG;
+        if (u.endsWith(".webp")) return Media.Format.IMAGE_WEBP;
+        if (u.endsWith(".gif")) return Media.Format.IMAGE_GIF;
+        return Media.Format.IMAGE_JPEG;
+    }
+
+    /**
+     * Portable options so you can set max_tokens even if DashScopeChatOptionsBuilder
+     * doesn't have maxTokens(...) in your version.
+     */
+    private static ChatOptions toChatOptions(String model, Map<String, Object> extraBody) {
+        ChatOptions.Builder b = ChatOptions.builder();
+
+        if (model != null && !model.isBlank()) {
+            b.model(model);
+        }
+
+        if (extraBody == null || extraBody.isEmpty()) {
+            return b.build();
+        }
+
+        // OpenAI-style keys -> ChatOptions
+        if (extraBody.get("temperature") instanceof Number n) b.temperature(n.doubleValue());
+        if (extraBody.get("top_p") instanceof Number n) b.topP(n.doubleValue());
+        if (extraBody.get("top_k") instanceof Number n) b.topK(n.intValue());
+        if (extraBody.get("max_tokens") instanceof Number n) b.maxTokens(n.intValue());
+
+        // Optional extras (if you pass them)
+        if (extraBody.get("presence_penalty") instanceof Number n) b.presencePenalty(n.doubleValue());
+        if (extraBody.get("frequency_penalty") instanceof Number n) b.frequencyPenalty(n.doubleValue());
+        if (extraBody.get("stop") instanceof List<?> stopList) {
+            List<String> stops = stopList.stream().map(String::valueOf).toList();
+            b.stopSequences(stops);
+        }
+
+        return b.build();
     }
 }

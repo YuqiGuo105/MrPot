@@ -8,6 +8,7 @@ import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.embedding.EmbeddingModel;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -54,7 +55,7 @@ public class RagRetrievalService {
      */
     private static final double ABSOLUTE_FLOOR_SCORE = 0.25;
 
-    private final EmbeddingModel embeddingModel;
+    private final @Qualifier("openAiEmbeddingModel") EmbeddingModel embeddingModel;
     private final KbDocumentVectorRepository kbRepository;
 
     /**
@@ -78,11 +79,16 @@ public class RagRetrievalService {
         // decide whether to expand the query using extracted file keywords.
         if (request == null || request.question() == null || request.question().isBlank()) {
             log.debug("RAG retrieval: empty question provided; skipping vector search");
-            return new RagRetrievalResult("", List.of(), "(empty question)");
+            return new RagRetrievalResult("", List.of(), "");
         }
 
         // 1. Get user question
         String question = request.question();
+
+        if (question == null || question.isEmpty()) {
+            log.debug("Input empty");
+            return new RagRetrievalResult(question, List.of(), "");
+        }
 
         // 2. Generate query embedding from the question
         float[] queryEmbedding = embeddingModel.embed(question);

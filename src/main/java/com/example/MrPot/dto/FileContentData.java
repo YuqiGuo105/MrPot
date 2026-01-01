@@ -1,4 +1,4 @@
-package com.example.MrPot.service.dto;
+package com.example.MrPot.dto;
 
 import com.example.MrPot.model.ExtractedFile;
 import lombok.Builder;
