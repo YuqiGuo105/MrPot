@@ -61,6 +61,15 @@ public class QwenVlFlashClient {
     }
 
     /**
+     * OCR + keyword extraction using public URL (recommended for large images or existing public links).
+     */
+    public Mono<DocumentUnderstandingResult> understandPublicUrlWithKeywords(String imageUrl, String userPrompt) {
+        String prompt = normalizePromptWithKeywords(userPrompt);
+        return postAndExtract(buildRequestBody(imageUrl, prompt))
+                .map(this::parseDocumentResult);
+    }
+
+    /**
      * OCR using Base64 data URL (recommended for small images < 7MB).
      */
     public Mono<String> ocrByBase64(byte[] imageBytes, String mimeType, String userPrompt) {
