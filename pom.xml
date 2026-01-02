@@ -20,9 +20,18 @@
 
     <properties>
         <java.version>21</java.version>
+
+        <!-- Spring AI Core -->
         <spring-ai.version>1.1.2</spring-ai.version>
+
+        <!-- Spring AI Alibaba (DashScope/Qwen) -->
+        <spring-ai-alibaba.version>1.1.2.0</spring-ai-alibaba.version>
+
         <!-- add explicit Lombok version -->
         <lombok.version>1.18.36</lombok.version>
+
+        <!-- NOTE: Removed direct dashscope-sdk-java version property; the Spring AI DashScope starter manages what it needs. -->
+        <!-- <dashscope.version>2.19.0</dashscope.version> -->
     </properties>
 
     <dependencies>
@@ -39,6 +48,25 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webflux</artifactId>
+        </dependency>
+
+        <!-- Spring AI Alibaba DashScope provider (Qwen / Qwen3-VL-Flash, etc.) -->
+        <dependency>
+            <groupId>com.alibaba.cloud.ai</groupId>
+            <artifactId>spring-ai-alibaba-starter-dashscope</artifactId>
+        </dependency>
+
+        <!-- If you still need to call the raw DashScope SDK directly, you can re-add it:
+        <dependency>
+            <groupId>com.alibaba.dashscope</groupId>
+            <artifactId>dashscope-sdk-java</artifactId>
+            <version>${dashscope.version}</version>
+        </dependency>
+        -->
+
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
         </dependency>
 
         <dependency>
@@ -118,21 +146,25 @@
             <version>${lombok.version}</version>
             <scope>provided</scope>
         </dependency>
+
         <dependency>
             <groupId>org.apache.pdfbox</groupId>
             <artifactId>pdfbox</artifactId>
             <version>3.0.6</version>
         </dependency>
+
         <dependency>
             <groupId>org.apache.tika</groupId>
             <artifactId>tika-core</artifactId>
             <version>3.2.3</version>
         </dependency>
+
         <dependency>
             <groupId>org.apache.tika</groupId>
             <artifactId>tika-parsers-standard-package</artifactId>
             <version>3.2.3</version>
         </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
@@ -144,6 +176,7 @@
             <artifactId>reactor-test</artifactId>
             <scope>test</scope>
         </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-jpa</artifactId>
@@ -152,10 +185,20 @@
 
     <dependencyManagement>
         <dependencies>
+            <!-- Spring AI core BOM -->
             <dependency>
                 <groupId>org.springframework.ai</groupId>
                 <artifactId>spring-ai-bom</artifactId>
                 <version>${spring-ai.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <!-- Spring AI Alibaba extensions BOM (DashScope/Qwen provider, etc.) -->
+            <dependency>
+                <groupId>com.alibaba.cloud.ai</groupId>
+                <artifactId>spring-ai-alibaba-extensions-bom</artifactId>
+                <version>${spring-ai-alibaba.version}</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>

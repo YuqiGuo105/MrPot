@@ -2,10 +2,7 @@ package com.example.MrPot.model;
 
 import com.example.MrPot.tools.ToolProfile;
 
-import java.util.HashSet;
-import java.util.List;
-import java.util.Locale;
-import java.util.Set;
+import java.util.*;
 
 /**
  * Request payload for generating an answer with RAG context.
@@ -44,10 +41,13 @@ public record RagAnswerRequest(
     }
 
     public List<String> resolveFileUrls(int maxFiles) {
-        if (fileUrls == null || fileUrls.isEmpty()) return List.of();
-        return fileUrls.stream()
-                .filter(u -> u != null && !u.isBlank())
-                .limit(Math.max(0, maxFiles))
+        if (this.fileUrls == null) return List.of();
+        return this.fileUrls.stream()
+                .filter(Objects::nonNull)
+                .map(String::trim)
+                .filter(s -> !s.isBlank())
+                .distinct()
+                .limit(Math.max(0, 3))
                 .toList();
     }
 

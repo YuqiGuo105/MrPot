@@ -1,9 +1,13 @@
 package com.example.MrPot.config;
 
+import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatModel;
+import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatOptions;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.deepseek.DeepSeekChatModel;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
@@ -12,6 +16,12 @@ import org.springframework.context.annotation.Primary;
 
 @Configuration
 public class AiConfig {
+
+    @Bean
+    @Primary
+    public EmbeddingModel embeddingModel(@Qualifier("openAiEmbeddingModel") EmbeddingModel openAi) {
+        return openAi;
+    }
 
     /**
      * DeepSeek is the default ChatClient.
@@ -37,6 +47,17 @@ public class AiConfig {
     public ChatClient openaiChatClient(OpenAiChatModel model) {
         return ChatClient.builder(model)
                 .defaultSystem("You're Mr Pot, Yuqi's LLM Agent")
+                .build();
+    }
+
+    @Bean
+    @ConditionalOnBean(DashScopeChatModel.class)
+    public ChatClient qwenChatClient(DashScopeChatModel model) {
+        return ChatClient.builder(model)
+                .defaultSystem("You're Mr Pot, Yuqi's LLM Agent")
+                .defaultOptions(DashScopeChatOptions.builder()
+                        .model("qwen-vl-plus")
+                        .build())
                 .build();
     }
 
