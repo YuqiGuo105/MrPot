@@ -498,6 +498,16 @@ public class RagAnswerService {
         return m;
     }
 
+    private static String safeText(String text) {
+        return text == null ? "" : text.replaceAll("\\s+", " ").trim();
+    }
+
+    private static <T> List<T> uniqLimit(List<T> list, int limit) {
+        if (list == null) return List.of();
+        LinkedHashSet<T> set = new LinkedHashSet<>(list);
+        return set.stream().limit(limit).toList();
+    }
+
     // --------------------------
     // Retrieval refinement
     // --------------------------
