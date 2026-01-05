@@ -1,6 +1,9 @@
 package com.example.MrPot.service;
 
 import com.example.MrPot.model.*;
+import com.example.MrPot.tools.FileTools;
+import com.example.MrPot.tools.KbTools;
+import com.example.MrPot.tools.MemoryTools;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -25,16 +28,15 @@ public class RagAnswerService {
 
     private static final Logger log = LoggerFactory.getLogger(RagAnswerService.class);
 
-    private final RagRetrievalService ragRetrievalService;
+    private final KbTools kbTools;
+    private final MemoryTools memoryTools;
+    private final FileTools fileTools;
     private final RedisChatMemoryService chatMemoryService;
     private final Map<String, ChatClient> chatClients;
 
     // --- Minimal analytics logger (2-table design) ---
     private final RagRunLogger runLogger;
     private final LogIngestionClient logIngestionClient;
-
-    // --- Unified Qwen VL extraction (all file types) ---
-    private final AttachmentService attachmentService;
 
     private static final int DEFAULT_TOP_K = 3;
     private static final double DEFAULT_MIN_SCORE = 0.60;
@@ -46,6 +48,7 @@ public class RagAnswerService {
 
     // Prompt budgets
     private static final int MAX_HISTORY_CHARS = 2500;
+    private static final int MAX_HISTORY_TURNS = 12;
     private static final int MAX_CONTEXT_CHARS = 7000;
     private static final int MAX_LOG_ROWS_IN_PROMPT = 8;
 
@@ -123,8 +126,7 @@ public class RagAnswerService {
 
         ChatClient chatClient = resolveClient(model);
 
-        var history = chatMemoryService.loadHistory(session.id());
-        String historyText = truncate(chatMemoryService.renderHistory(history), MAX_HISTORY_CHARS);
+        String historyText = truncate(memoryTools.recent(session.id(), MAX_HISTORY_TURNS), MAX_HISTORY_CHARS);
 
         boolean noEvidence = !ctx.hasAnyRef;
         String prompt = buildPrompt(
@@ -177,8 +179,7 @@ public class RagAnswerService {
                 .flatMapMany(ctx -> {
                     ChatClient chatClient = resolveClient(model);
 
-                    var history = chatMemoryService.loadHistory(session.id());
-                    String historyText = truncate(chatMemoryService.renderHistory(history), MAX_HISTORY_CHARS);
+                    String historyText = truncate(memoryTools.recent(session.id(), MAX_HISTORY_TURNS), MAX_HISTORY_CHARS);
 
                     boolean noEvidence = !ctx.hasAnyRef;
                     String prompt = buildPrompt(
@@ -235,15 +236,15 @@ public class RagAnswerService {
         AtomicReference<RagRetrievalResult> retrievalRef = new AtomicReference<>(null);
         AtomicReference<String> errorRef = new AtomicReference<>(null);
 
-        Mono<List<RedisChatMemoryService.StoredMessage>> historyMono =
-                Mono.fromCallable(() -> chatMemoryService.loadHistory(session.id()))
+        Mono<String> historyMono =
+                Mono.fromCallable(() -> memoryTools.recent(session.id(), MAX_HISTORY_TURNS))
                         .subscribeOn(Schedulers.boundedElastic())
                         .cache();
 
         Mono<List<FileItem>> filesMono = extractFilesMono(urls).cache();
 
         Mono<RagRetrievalResult> retrieval0Mono =
-                Mono.fromCallable(() -> ragRetrievalService.retrieve(new RagQueryRequest(request.question(), topK, minScore)))
+                Mono.fromCallable(() -> kbTools.search(request.question(), topK, minScore))
                         .subscribeOn(Schedulers.boundedElastic())
                         .cache();
 
@@ -259,7 +260,7 @@ public class RagAnswerService {
                             String expandedQuery = buildExpandedRetrievalQuery(request.question(), terms);
                             if (expandedQuery.equals(request.question())) return Mono.just(r0);
 
-                            return Mono.fromCallable(() -> ragRetrievalService.retrieve(new RagQueryRequest(expandedQuery, topK, minScore)))
+                            return Mono.fromCallable(() -> kbTools.search(expandedQuery, topK, minScore))
                                     .subscribeOn(Schedulers.boundedElastic())
                                     .onErrorReturn(r0);
                         })
@@ -320,7 +321,7 @@ public class RagAnswerService {
                             boolean noEvidence = !hasAnyRef;
                             noEvidenceRef.set(noEvidence);
 
-                            String historyText = truncate(chatMemoryService.renderHistory(history), MAX_HISTORY_CHARS);
+                            String historyText = truncate(history, MAX_HISTORY_CHARS);
                             String prompt = buildPrompt(request.question(), retrieval, historyText, fileText, noEvidence, outOfScopeKb);
                             promptRef.set(prompt);
 
@@ -384,7 +385,7 @@ public class RagAnswerService {
         Mono<List<FileItem>> filesMono = extractFilesMono(urls).cache();
 
         Mono<RagRetrievalResult> retrieval0Mono =
-                Mono.fromCallable(() -> ragRetrievalService.retrieve(new RagQueryRequest(request.question(), topK, minScore)))
+                Mono.fromCallable(() -> kbTools.search(request.question(), topK, minScore))
                         .subscribeOn(Schedulers.boundedElastic())
                         .cache();
 
@@ -400,7 +401,7 @@ public class RagAnswerService {
                             String expandedQuery = buildExpandedRetrievalQuery(request.question(), terms);
                             if (expandedQuery.equals(request.question())) return Mono.just(r0);
 
-                            return Mono.fromCallable(() -> ragRetrievalService.retrieve(new RagQueryRequest(expandedQuery, topK, minScore)))
+                            return Mono.fromCallable(() -> kbTools.search(expandedQuery, topK, minScore))
                                     .subscribeOn(Schedulers.boundedElastic())
                                     .onErrorReturn(r0);
                         })
@@ -422,7 +423,7 @@ public class RagAnswerService {
     }
 
     // --------------------------
-    // Files: unified Qwen VL extraction
+    // Files: unified extraction via FileTools
     // --------------------------
     private Mono<List<FileItem>> extractFilesMono(List<String> urls) {
         if (urls == null || urls.isEmpty()) return Mono.just(List.of());
@@ -454,19 +455,17 @@ public class RagAnswerService {
         String mime = guessMimeFromUrl(url);
 
         try {
-            Object raw = attachmentService.understandFileUrlWithQwenVl(url);
-            Understanding u = toUnderstanding(raw);
+            FileTools.FileUnderstanding understanding = fileTools.understandUrl(url);
 
-            String keyText = safeText(u.text());
+            String keyText = safeText(understanding.text());
 
-            // 额外保护：如果模型返回空但没抛异常，也要让 error 可见（便于你 debug）
-            if (keyText.isBlank() && (u.keywords() == null || u.keywords().isEmpty()) && (u.queries() == null || u.queries().isEmpty())) {
+            if (keyText.isBlank() && understanding.keywords().isEmpty() && understanding.queries().isEmpty()) {
                 return new FileItem(
                         url, name, mime,
                         "",
                         List.of(),
                         List.of(),
-                        "extract_empty_result"
+                        understanding.error() == null ? "extract_empty_result" : understanding.error()
                 );
             }
 
@@ -475,12 +474,11 @@ public class RagAnswerService {
                     name,
                     mime,
                     keyText,
-                    uniqLimit(u.keywords(), 30),
-                    uniqLimit(u.queries(), 30),
-                    null
+                    uniqLimit(understanding.keywords(), 30),
+                    uniqLimit(understanding.queries(), 30),
+                    understanding.error()
             );
         } catch (Exception ex) {
-            // ✅ 关键修复：这里就把错误转成 FileItem，而不是抛出让上层变成统一 extract_failed
             String err = "extract_failed: " + ex.getClass().getSimpleName() + ": " + safeMsg(ex);
             log.warn("[FileExtract] url={} name={} mime={} err={}", url, name, mime, err);
             return new FileItem(
@@ -500,181 +498,102 @@ public class RagAnswerService {
         return m;
     }
 
-    // Normalize output from AttachmentService (String / POJO / JSON) into text+keywords+queries
-    private record Understanding(String text, List<String> keywords, List<String> queries) {}
-
-    private Understanding toUnderstanding(Object obj) {
-        if (obj == null) return new Understanding("", List.of(), List.of());
-
-        if (obj instanceof String s) {
-            return parseUnderstandingFromString(s);
-        }
-
-        try {
-            JsonNode n = OM.valueToTree(obj);
-            return parseUnderstandingFromJsonNode(n, OM.writeValueAsString(obj));
-        } catch (Exception e) {
-            return new Understanding(String.valueOf(obj), List.of(), List.of());
-        }
-    }
-
-    private Understanding parseUnderstandingFromString(String s) {
-        String cleaned = cleanupModelOutput(s);
-        if (cleaned.isBlank()) return new Understanding("", List.of(), List.of());
-
-        Understanding u = tryParseJsonUnderstanding(cleaned);
-        if (u != null) return u;
-
-        String json = extractFirstJsonObject(cleaned);
-        u = tryParseJsonUnderstanding(json);
-        if (u != null) return u;
-
-        return new Understanding(cleaned, List.of(), List.of());
-    }
-
-    private Understanding tryParseJsonUnderstanding(String maybeJson) {
-        if (maybeJson == null) return null;
-        String t = maybeJson.trim();
-        if (!t.startsWith("{")) return null;
-        try {
-            JsonNode n = OM.readTree(t);
-            return parseUnderstandingFromJsonNode(n, t);
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    private Understanding parseUnderstandingFromJsonNode(JsonNode n, String fallbackText) {
-        if (n == null || !n.isObject()) {
-            return new Understanding(fallbackText == null ? "" : fallbackText, List.of(), List.of());
-        }
-        String text = n.path("text").asText("");
-        List<String> keywords = readStringArray(n.path("keywords"));
-        List<String> queries = readStringArray(n.path("queries"));
-
-        if (text == null || text.isBlank()) text = fallbackText == null ? "" : fallbackText;
-        return new Understanding(text, keywords, queries);
-    }
-
-    private List<String> readStringArray(JsonNode arr) {
-        if (arr == null || !arr.isArray()) return List.of();
-        List<String> out = new ArrayList<>();
-        for (JsonNode x : arr) {
-            if (x == null) continue;
-            String v = x.asText("");
-            if (v != null && !v.trim().isBlank()) out.add(v.trim());
-        }
-        return out;
-    }
-
-    private String cleanupModelOutput(String s) {
-        if (s == null) return "";
-        String t = s.trim();
-        t = t.replaceAll("^```(?:json)?\\s*", "");
-        t = t.replaceAll("\\s*```\\s*$", "");
-        return t.trim();
-    }
-
-    private String extractFirstJsonObject(String s) {
-        if (s == null) return null;
-        int start = s.indexOf('{');
-        int end = s.lastIndexOf('}');
-        if (start >= 0 && end > start) return s.substring(start, end + 1).trim();
-        return null;
-    }
-
-    private static String safeText(String s) {
-        return s == null ? "" : s.trim();
-    }
-
-    private static List<String> uniqLimit(List<String> xs, int max) {
-        if (xs == null || xs.isEmpty() || max <= 0) return List.of();
-        LinkedHashSet<String> set = new LinkedHashSet<>();
-        for (String x : xs) {
-            if (x == null) continue;
-            String t = x.trim();
-            if (!t.isBlank()) set.add(t);
-            if (set.size() >= max) break;
-        }
-        return set.stream().toList();
-    }
-
-    private static String filenameFromUrl(String url) {
-        try {
-            URI u = URI.create(url);
-            String path = u.getPath();
-            if (path == null || path.isBlank()) return "file";
-            int idx = path.lastIndexOf('/');
-            String name = idx >= 0 ? path.substring(idx + 1) : path;
-            return (name == null || name.isBlank()) ? "file" : name;
-        } catch (Exception e) {
-            return "file";
-        }
-    }
-
-    private static String guessMimeFromUrl(String url) {
-        if (url == null) return "application/octet-stream";
-        String lower = url.toLowerCase(Locale.ROOT);
-        if (lower.endsWith(".pdf")) return "application/pdf";
-        if (lower.endsWith(".png")) return "image/png";
-        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
-        if (lower.endsWith(".webp")) return "image/webp";
-        if (lower.endsWith(".txt")) return "text/plain";
-        if (lower.endsWith(".json")) return "application/json";
-        if (lower.endsWith(".md")) return "text/markdown";
-        return "application/octet-stream";
-    }
-
     // --------------------------
-    // File insights -> retrieval + prompt
+    // Retrieval refinement
     // --------------------------
-    private static boolean shouldRefineRetrieval(RagRetrievalResult retrieval, List<String> terms) {
-        if (terms == null || terms.isEmpty()) return false;
-        if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) return true;
-        double top = retrieval.documents().stream().mapToDouble(ScoredDocument::score).max().orElse(0.0);
-        return top < REFINE_TOP_SCORE_THRESHOLD;
-    }
-
-    private static String buildExpandedRetrievalQuery(String question, List<String> terms) {
-        String q = question == null ? "" : question.trim();
-        if (terms == null || terms.isEmpty()) return q;
-
-        String joined = String.join(", ", terms);
-        if (joined.length() > MAX_FILE_QUERY_CHARS) {
-            joined = joined.substring(0, MAX_FILE_QUERY_CHARS) + "...";
-        }
-        return q + "\nFile terms: " + joined;
-    }
-
-    private static List<String> collectRetrievalTerms(List<FileItem> files, int limit) {
-        if (files == null || files.isEmpty() || limit <= 0) return List.of();
+    private List<String> collectRetrievalTerms(List<FileItem> files, int maxTerms) {
+        if (files == null || maxTerms <= 0) return List.of();
 
         LinkedHashSet<String> set = new LinkedHashSet<>();
+
         for (FileItem f : files) {
-            for (String q : safeList(f == null ? null : f.queries())) {
-                if (set.size() >= limit) break;
+            if (f == null) continue;
+
+            for (String q : safeList(f.queries())) {
+                if (set.size() >= maxTerms) break;
                 addTerm(set, q);
             }
-            if (set.size() >= limit) break;
-        }
-        for (FileItem f : files) {
-            for (String kw : safeList(f == null ? null : f.keywords())) {
-                if (set.size() >= limit) break;
+
+            for (String kw : safeList(f.keywords())) {
+                if (set.size() >= maxTerms) break;
                 addTerm(set, kw);
             }
-            if (set.size() >= limit) break;
+
+            if (set.size() >= maxTerms) break;
         }
+
         return set.stream().toList();
     }
 
-    private static void addTerm(Set<String> set, String s) {
-        if (s == null) return;
-        String t = s.trim();
+    private boolean shouldRefineRetrieval(RagRetrievalResult original, List<String> terms) {
+        if (terms == null || terms.isEmpty()) return false;
+        if (original == null || original.documents() == null || original.documents().isEmpty()) return true;
+
+        double topScore = original.documents().stream()
+                .mapToDouble(ScoredDocument::score)
+                .max()
+                .orElse(0.0);
+
+        return topScore < REFINE_TOP_SCORE_THRESHOLD;
+    }
+
+    private String buildExpandedRetrievalQuery(String baseQuery, List<String> terms) {
+        if (terms == null || terms.isEmpty()) return Optional.ofNullable(baseQuery).orElse("");
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(Optional.ofNullable(baseQuery).orElse(""));
+
+        int addedChars = 0;
+        for (String t : terms) {
+            if (t == null || t.isBlank()) continue;
+            if (addedChars >= MAX_FILE_QUERY_CHARS) break;
+            sb.append(" | ").append(t);
+            addedChars += t.length();
+        }
+
+        return sb.toString();
+    }
+
+    private void addTerm(LinkedHashSet<String> set, String term) {
+        if (term == null) return;
+        String t = term.trim();
         if (t.isBlank()) return;
         if (t.length() > 80) t = t.substring(0, 80);
         set.add(t);
     }
 
+    // --------------------------
+    // Utilities: URLs
+    // --------------------------
+    private String filenameFromUrl(String url) {
+        try {
+            URI u = URI.create(url);
+            String path = Optional.ofNullable(u.getPath()).orElse("");
+            if (path.isBlank()) return "file";
+            String[] parts = path.split("/");
+            String last = parts[parts.length - 1];
+            return last.isBlank() ? "file" : last;
+        } catch (Exception e) {
+            return "file";
+        }
+    }
+
+    private String guessMimeFromUrl(String url) {
+        if (url == null) return "application/octet-stream";
+        String lower = url.toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".png")) return "image/png";
+        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+        if (lower.endsWith(".gif")) return "image/gif";
+        if (lower.endsWith(".pdf")) return "application/pdf";
+        if (lower.endsWith(".txt")) return "text/plain";
+        if (lower.endsWith(".html") || lower.endsWith(".htm")) return "text/html";
+        if (lower.endsWith(".md")) return "text/markdown";
+        return "application/octet-stream";
+    }
+
+    // --------------------------
+    // File summarization and context assembly
+    // --------------------------
     private FileInsights summarizeFileInsights(List<FileItem> files) {
         List<FileItem> safeFiles = safeList(files);
 
@@ -925,19 +844,21 @@ public class RagAnswerService {
         return Optional.empty();
     }
 
-    private static int scoreChunk(String chunk, List<String> keywords) {
-        if (chunk == null || chunk.isBlank() || keywords == null || keywords.isEmpty()) return 0;
+    private int scoreChunk(String text, List<String> userKeywords) {
+        if (text == null || text.isBlank() || userKeywords.isEmpty()) return 0;
 
-        String lower = chunk.toLowerCase(Locale.ROOT);
+        String lower = text.toLowerCase(Locale.ROOT);
+
         int score = 0;
-        for (String kw : keywords) {
-            if (kw == null || kw.isBlank()) continue;
-            String k = kw.toLowerCase(Locale.ROOT);
-
-            int idx = 0;
-            while ((idx = lower.indexOf(k, idx)) >= 0) {
+        for (String k : userKeywords) {
+            if (lower.contains(k.toLowerCase(Locale.ROOT))) {
                 score += 2;
-                idx += k.length();
+            } else {
+                int idx = lower.indexOf(k.toLowerCase(Locale.ROOT));
+                while (idx >= 0) {
+                    score++;
+                    idx = lower.indexOf(k.toLowerCase(Locale.ROOT), idx + 1);
+                }
             }
         }
         return score;
@@ -991,18 +912,9 @@ public class RagAnswerService {
                 .toList();
     }
 
-    private List<Map<String, Object>> summarizeHistory(List<RedisChatMemoryService.StoredMessage> history) {
-        if (history == null || history.isEmpty()) return List.of();
-
-        int maxMessages = 6;
-        int startIdx = Math.max(0, history.size() - maxMessages);
-
-        return history.subList(startIdx, history.size()).stream()
-                .map(m -> Map.<String, Object>of(
-                        "role", m.role(),
-                        "content", m.content()
-                ))
-                .toList();
+    private List<Map<String, Object>> summarizeHistory(String historyText) {
+        if (historyText == null || historyText.isBlank()) return List.of();
+        return List.of(Map.of("preview", truncate(historyText, 500)));
     }
 
     private List<Map<String, Object>> summarizeRetrieval(RagRetrievalResult retrieval) {
