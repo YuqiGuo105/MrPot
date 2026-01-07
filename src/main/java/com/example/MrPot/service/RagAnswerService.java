@@ -165,7 +165,7 @@ public class RagAnswerService {
 
         PreparedContext ctx = prepareContextMono(request, topK, minScore, deepThinking)
                 .blockOptional()
-                .orElse(new PreparedContext(new RagRetrievalResult("", List.of(), ""), "", true, false, ScopeGuardTools.ScopeGuardResult.allowedDefault(scopeMode.name()), List.of(), "", new SanitizedEvidence("", "", Map.of())));
+                .orElse(new PreparedContext(new RagRetrievalResult("", List.of(), ""), "", true, false, ScopeGuardTools.ScopeGuardResult.scopedDefault(), List.of(), "", new SanitizedEvidence("", "", Map.of())));
 
         ChatClient chatClient = resolveClient(model);
 
@@ -319,10 +319,10 @@ public class RagAnswerService {
         Mono<String> fileTextMono = fileInsightsMono.map(FileInsights::promptContext).defaultIfEmpty("").cache();
 
         Mono<ScopeGuardTools.ScopeGuardResult> scopeGuardMono = deepThinking
-                ? Mono.fromCallable(() -> scopeGuardTools.guard(request.question(), scopeMode.name()))
+                ? Mono.fromCallable(() -> scopeGuardTools.guard(request.question()))
                         .subscribeOn(Schedulers.boundedElastic())
                         .cache()
-                : Mono.just(ScopeGuardTools.ScopeGuardResult.allowedDefault(scopeMode.name()));
+                : Mono.just(ScopeGuardTools.ScopeGuardResult.scopedDefault());
 
         Mono<EntityResolveTools.EntityResolveResult> entityResolveMono = Mono.zip(roadmapPlanMono, fileTextMono)
                 .flatMap(tuple -> {
@@ -422,7 +422,7 @@ public class RagAnswerService {
                         "scope_guard",
                         "Scope guard",
                         Map.of(
-                                "allowed", result.allowed(),
+                                "scoped", result.scoped(),
                                 "reason", result.reason(),
                                 "rewriteHint", result.rewriteHint()
                         )
@@ -654,10 +654,10 @@ public class RagAnswerService {
         Mono<String> fileTextMono = fileInsightsMono.map(FileInsights::promptContext).defaultIfEmpty("").cache();
 
         Mono<ScopeGuardTools.ScopeGuardResult> scopeGuardMono = deepThinking
-                ? Mono.fromCallable(() -> scopeGuardTools.guard(request.question(), scopeMode.name()))
+                ? Mono.fromCallable(() -> scopeGuardTools.guard(request.question()))
                         .subscribeOn(Schedulers.boundedElastic())
                         .cache()
-                : Mono.just(ScopeGuardTools.ScopeGuardResult.allowedDefault(scopeMode.name()));
+                : Mono.just(ScopeGuardTools.ScopeGuardResult.scopedDefault());
 
         Mono<EntityResolveTools.EntityResolveResult> entityResolveMono = Mono.zip(roadmapPlanMono, fileTextMono)
                 .flatMap(tuple -> {
@@ -876,7 +876,7 @@ public class RagAnswerService {
                     boolean hasAnyRef = hasAnyReference(retrieval, fileText);
 
                     if (deepThinking) {
-                        if (guard != null && !guard.allowed()) {
+                        if (guard != null && !guard.scoped()) {
                             outOfScopeKb = true;
                             hasAnyRef = false;
                         }
@@ -885,7 +885,7 @@ public class RagAnswerService {
                         }
                     }
 
-                    if (scopeMode == RagAnswerRequest.ScopeMode.YUQI_ONLY && (guard == null || !guard.allowed())) {
+                    if (scopeMode == RagAnswerRequest.ScopeMode.YUQI_ONLY && (guard == null || !guard.scoped())) {
                         outOfScopeKb = true;
                         hasAnyRef = false;
                     }
@@ -1176,7 +1176,7 @@ public class RagAnswerService {
                 outOfScopeKb,
                 false,
                 RagAnswerRequest.ScopeMode.PRIVACY_SAFE,
-                ScopeGuardTools.ScopeGuardResult.allowedDefault(RagAnswerRequest.ScopeMode.PRIVACY_SAFE.name()),
+                ScopeGuardTools.ScopeGuardResult.scopedDefault(),
                 List.of(),
                 ""
         );
@@ -1198,7 +1198,7 @@ public class RagAnswerService {
         String contextText = compactLogContext(rawContext, MAX_CONTEXT_CHARS);
         String compressed = truncate(Optional.ofNullable(compressedContext).orElse(""), MAX_CONTEXT_CHARS);
         ScopeGuardTools.ScopeGuardResult guard = scopeGuardResult == null
-                ? ScopeGuardTools.ScopeGuardResult.allowedDefault(scopeMode.name())
+                ? ScopeGuardTools.ScopeGuardResult.scopedDefault()
                 : scopeGuardResult;
         List<String> safeTerms = entityTerms == null ? List.of() : entityTerms;
 
@@ -1208,7 +1208,7 @@ public class RagAnswerService {
 
         sb.append("Meta: noEvidence=").append(noEvidence)
                 .append(", kbWeak=").append(outOfScopeKb)
-                .append(", scopeAllowed=").append(guard.allowed())
+                .append(", scopeScoped=").append(guard.scoped())
                 .append(", deepThinking=").append(deepThinking)
                 .append(", scopeMode=").append(scopeMode)
                 .append("\n\n");
@@ -1219,7 +1219,7 @@ public class RagAnswerService {
         if (guard.rewriteHint() != null && !guard.rewriteHint().isBlank()) {
             sb.append("Rewrite hint: ").append(guard.rewriteHint()).append("\n\n");
         }
-        if (!guard.allowed()) {
+        if (!guard.scoped()) {
             if (scopeMode == RagAnswerRequest.ScopeMode.YUQI_ONLY) {
                 sb.append("Instruction: reply exactly with ").append(OUT_OF_SCOPE_REPLY).append(".\n\n");
             } else {
