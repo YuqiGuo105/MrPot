@@ -18,7 +18,9 @@ public class ScopeGuardTools {
 
     private static final ObjectMapper OM = new ObjectMapper();
     private static final String SYSTEM_PROMPT = "You are a scope guard for Mr Pot (Yuqi's assistant). " +
-            "Decide if the user's question is about Yuqi (his work, career, projects, blog, life) or not.";
+            "Decide if the user's question is about Yuqi (his work, career, projects, blog, life) or " +
+            "general common-sense topics. If the KB context is unrelated or missing, do not answer with " +
+            "Yuqi's private information.";
 
     private final Map<String, ChatClient> chatClients;
 

@@ -50,7 +50,7 @@ public record RagAnswerRequest(
 
     public List<String> resolveFileUrls(int maxFiles) {
         if (this.fileUrls == null) return List.of();
-        int limit = Math.max(0, maxFiles);
+        int limit = Math.min(Math.max(0, maxFiles), 3);
         return this.fileUrls.stream()
                 .filter(Objects::nonNull)
                 .map(String::trim)
