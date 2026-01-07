@@ -16,6 +16,21 @@ Mr Pot is a Spring Boot RAG service that streams "thinking" events while answeri
 3. **Prompt assembly**: `RagAnswerService` builds a system/user prompt containing KB snippets (CTX), file insights (FILE), and chat history (HIS) while enforcing budgets for characters, attachment counts, and QA hints.
 4. **Answering**: A `ChatClient` executes the prompt; responses are streamed as SSE `ThinkingEvent` stages (`start`, `redis`, `rag`, `answer_delta`, `answer_final`). Blocking calls append to Redis chat memory after completion.
 
+### Deep thinking mode
+
+`RagAnswerRequest` accepts an optional `deepThinking` flag. When `deepThinking=true`, the backend runs extra helper steps (scope guard, entity resolve, context compression) and emits additional SSE events before the streamed answer (`deep_think_mode`, `scope_guard`, `entity_resolve`, `context_compress`). When omitted or `false`, the request behaves as before.
+
+Example request body:
+
+```json
+{
+  "question": "他有什么技能",
+  "sessionId": "0002424232",
+  "deepThinking": true,
+  "fileUrls": ["https://.../Yuqi_Guo_Resume.pdf"]
+}
+```
+
 ## API endpoints
 
 - `POST /api/rag/answer`: blocking RAG answer for a question payload.
