@@ -40,7 +40,7 @@ public record RagAnswerRequest(
     }
 
     public boolean resolveDeepThinking(boolean defaultValue) {
-        return deepThinking == null ? defaultValue : deepThinking;
+        return deepThinking != null && deepThinking;
     }
 
     public String resolveModel() {
