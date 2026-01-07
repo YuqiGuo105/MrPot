@@ -7,16 +7,20 @@ import java.util.*;
 /**
  * Request payload for generating an answer with RAG context.
  *
- * @param question   user question
- * @param sessionId  chat session id for memory separation
- * @param topK       optional override for retrieval topK
- * @param minScore   optional override for retrieval minScore
- * @param model      optional model name hint (e.g. "deepseek", "openai")
+ * @param question     user question
+ * @param sessionId    chat session id for memory separation
+ * @param deepThinking whether to enable enhanced reasoning and helper steps
+ * @param topK         optional override for retrieval topK
+ * @param minScore     optional override for retrieval minScore
+ * @param model        optional model name hint (e.g. "deepseek", "openai")
  * @param toolProfile  optional tool profile (e.g. "BASIC_CHAT", "ADMIN", "FULL")
+ * @param fileUrls     optional external file URLs for attachment
+ * @param visionModel  optional vision model key
  */
 public record RagAnswerRequest(
         String question,
         String sessionId,
+        Boolean deepThinking,
         Integer topK,
         Double minScore,
         String model,
@@ -35,6 +39,10 @@ public record RagAnswerRequest(
         return minScore == null ? defaultValue : minScore;
     }
 
+    public boolean resolveDeepThinking(boolean defaultValue) {
+        return deepThinking == null ? defaultValue : deepThinking;
+    }
+
     public String resolveModel() {
         return (model == null || model.isBlank()
         || !models.contains(model)) ? DEFAULT_MODEL : model;
@@ -42,12 +50,13 @@ public record RagAnswerRequest(
 
     public List<String> resolveFileUrls(int maxFiles) {
         if (this.fileUrls == null) return List.of();
+        int limit = Math.max(0, maxFiles);
         return this.fileUrls.stream()
                 .filter(Objects::nonNull)
                 .map(String::trim)
                 .filter(s -> !s.isBlank())
                 .distinct()
-                .limit(Math.max(0, 3))
+                .limit(limit)
                 .toList();
     }
 
