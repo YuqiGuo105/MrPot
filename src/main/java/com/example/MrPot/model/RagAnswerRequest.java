@@ -10,6 +10,7 @@ import java.util.*;
  * @param question     user question
  * @param sessionId    chat session id for memory separation
  * @param deepThinking whether to enable enhanced reasoning and helper steps
+ * @param scopeMode    scope mode for privacy/scope checks
  * @param topK         optional override for retrieval topK
  * @param minScore     optional override for retrieval minScore
  * @param model        optional model name hint (e.g. "deepseek", "openai")
@@ -21,6 +22,7 @@ public record RagAnswerRequest(
         String question,
         String sessionId,
         Boolean deepThinking,
+        ScopeMode scopeMode,
         Integer topK,
         Double minScore,
         String model,
@@ -30,6 +32,12 @@ public record RagAnswerRequest(
 ) {
     private static final Set<String> models = Set.of("deepseek", "gemini", "openai");
     public static final String DEFAULT_MODEL = "deepseek";
+    public static final ScopeMode DEFAULT_SCOPE_MODE = ScopeMode.PRIVACY_SAFE;
+
+    public enum ScopeMode {
+        PRIVACY_SAFE,
+        YUQI_ONLY
+    }
 
     public int resolveTopK(int defaultValue) {
         return topK == null || topK <= 0 ? defaultValue : topK;
@@ -41,6 +49,10 @@ public record RagAnswerRequest(
 
     public boolean resolveDeepThinking(boolean defaultValue) {
         return deepThinking != null && deepThinking;
+    }
+
+    public ScopeMode resolveScopeMode() {
+        return scopeMode == null ? DEFAULT_SCOPE_MODE : scopeMode;
     }
 
     public String resolveModel() {

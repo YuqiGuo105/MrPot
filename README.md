@@ -18,7 +18,7 @@ Mr Pot is a Spring Boot RAG service that streams "thinking" events while answeri
 
 ### Deep thinking mode
 
-`RagAnswerRequest` accepts an optional `deepThinking` flag. When `deepThinking=true`, the backend runs extra helper steps (scope guard, entity resolve, context compression) and emits additional SSE events before the streamed answer (`deep_think_mode`, `scope_guard`, `entity_resolve`, `context_compress`). When omitted or `false`, the request behaves as before.
+`RagAnswerRequest` accepts optional `deepThinking` and `scopeMode` flags. When `deepThinking=true`, the backend runs extra helper steps (roadmap planning, scope guard, entity resolve, privacy sanitize, context compression, verification) and emits additional SSE events before the streamed answer (`roadmap`, `deep_think_mode`, `scope_guard`, `privacy_sanitize`, `evidence`, `entity_resolve`, `context_compress`, `key_info`, `conflict_detect`, `answer_verify`). When omitted or `false`, the request behaves as before. `scopeMode` defaults to `PRIVACY_SAFE` (general questions allowed; privacy requests rejected). Use `YUQI_ONLY` to force Yuqi-only questions.
 
 Example request body:
 
@@ -27,7 +27,8 @@ Example request body:
   "question": "他有什么技能",
   "sessionId": "0002424232",
   "deepThinking": true,
-  "fileUrls": ["https://.../Yuqi_Guo_Resume.pdf"]
+  "fileUrls": ["https://.../Yuqi_Guo_Resume.pdf"],
+  "scopeMode": "PRIVACY_SAFE"
 }
 ```
 
@@ -48,6 +49,7 @@ curl -N --http1.1 -X POST "http://localhost:8080/api/rag/answer/stream" \
     "question": "他有什么技能",
     "sessionId": "0002424232",
     "deepThinking": true,
+    "scopeMode": "PRIVACY_SAFE",
     "fileUrls": ["https://.../Yuqi_Guo_Resume.pdf"]
   }'
 ```
@@ -58,6 +60,7 @@ Swagger UI is available at http://localhost:8080/swagger-ui when the app is runn
 
 - **DashScope (Qwen)**: provide an API key via the environment variable `DASHSCOPE_API_KEY` so Spring AI can initialize the DashScope client and related tooling.
 - **Server**: defaults to port `8080`. Adjust standard Spring Boot settings (e.g., via `application.yaml`) as needed for your environment.
+- **Code search (optional)**: set `mrpot.code.root` to an absolute repo path to enable the `code_search` tool for deep thinking.
 
 ### Local development
 
