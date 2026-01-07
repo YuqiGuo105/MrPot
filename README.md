@@ -38,6 +38,20 @@ Example request body:
 - `GET /api/rag/retrieve`: simple retrieval with query parameter `q` using default `topK/minScore`.
 - `POST /api/rag/retrieve`: advanced retrieval where `topK` and `minScore` can be supplied in the body.
 
+### SSE streaming from the command line
+
+```bash
+curl -N --http1.1 -X POST "http://localhost:8080/api/rag/answer/stream" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+    "question": "他有什么技能",
+    "sessionId": "0002424232",
+    "deepThinking": true,
+    "fileUrls": ["https://.../Yuqi_Guo_Resume.pdf"]
+  }'
+```
+
 Swagger UI is available at http://localhost:8080/swagger-ui when the app is running.
 
 ## Configuration

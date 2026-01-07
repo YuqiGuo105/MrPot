@@ -106,6 +106,12 @@ public class RagAnswerService {
             String compressedContext
     ) { }
 
+    private record RoadmapInfo(List<String> steps, List<String> keyInfo, String raw) {
+        static RoadmapInfo empty() {
+            return new RoadmapInfo(List.of(), List.of(), "");
+        }
+    }
+
     private static final String SYSTEM_PROMPT =
             "You are Mr Pot, Yuqi's assistant and a general-purpose helpful AI. " +
                     "Reply in the user's language. Be friendly, slightly playful, and human-like (no insults; no made-up facts). " +
@@ -117,6 +123,14 @@ public class RagAnswerService {
                     "If asked for a number but evidence only supports a status/statement, answer the supported status/statement. " +
                     "If a Yuqi-mode question lacks evidence, reply exactly: \"" + OUT_OF_SCOPE_REPLY + "\". " +
                     "General-mode: for common sense/general knowledge/how-to/coding/science, answer normally even if CTX/FILE/HIS are empty or irrelevant.";
+
+    private static final String ROADMAP_SYSTEM_PROMPT =
+            "You are preparing a brief roadmap and key info summary for answering a user. " +
+                    "Keep it concise and grounded in the provided evidence.";
+
+    private static final int MAX_ROADMAP_STEPS = 5;
+    private static final int MAX_KEY_INFO = 6;
+    private static final int MAX_ROADMAP_CONTEXT_CHARS = 1200;
 
     // --------------------------
     // Blocking answer
@@ -297,6 +311,13 @@ public class RagAnswerService {
                 compressedMono
         ).cache();
 
+        Mono<RoadmapInfo> roadmapMono = deepThinking
+                ? preparedContextMono.flatMap(ctx -> Mono.fromCallable(() ->
+                        buildRoadmapInfo(chatClient, request.question(), ctx))
+                        .subscribeOn(Schedulers.boundedElastic()))
+                        .cache()
+                : Mono.just(RoadmapInfo.empty());
+
         Flux<ThinkingEvent> startStep = Flux.just(
                 new ThinkingEvent("start", "Init", Map.of("ts", System.currentTimeMillis()))
         );
@@ -369,6 +390,22 @@ public class RagAnswerService {
                         "context_compress",
                         "Compressed context",
                         Map.of("preview", truncate(summary, PROGRESS_EXCERPT_CHARS))
+                ))
+        ) : Flux.empty();
+
+        Flux<ThinkingEvent> roadmapStep = deepThinking ? roadmapMono.flatMapMany(roadmap ->
+                Flux.just(new ThinkingEvent(
+                        "roadmap",
+                        "Answer roadmap",
+                        Map.of("steps", roadmap.steps())
+                ))
+        ) : Flux.empty();
+
+        Flux<ThinkingEvent> keyInfoStep = deepThinking ? roadmapMono.flatMapMany(roadmap ->
+                Flux.just(new ThinkingEvent(
+                        "key_info",
+                        "Key info",
+                        Map.of("items", roadmap.keyInfo())
                 ))
         ) : Flux.empty();
 
@@ -448,6 +485,8 @@ public class RagAnswerService {
                 redisStep,
                 ragStep,
                 contextCompressStep,
+                roadmapStep,
+                keyInfoStep,
                 answerDeltaStep,
                 finalStep
         );
@@ -665,6 +704,97 @@ public class RagAnswerService {
 
                     return new PreparedContext(retrieval, fileText, outOfScopeKb, hasAnyRef, guard, entityTerms, compressed);
                 });
+    }
+
+    private RoadmapInfo buildRoadmapInfo(ChatClient chatClient, String question, PreparedContext ctx) {
+        String compressed = Optional.ofNullable(ctx.compressedContext()).orElse("");
+        String evidence = compressed.isBlank()
+                ? Optional.ofNullable(ctx.retrieval()).map(RagRetrievalResult::context).orElse("")
+                : compressed;
+        evidence = truncate(evidence, MAX_ROADMAP_CONTEXT_CHARS);
+
+        List<String> entityTerms = ctx.entityTerms() == null ? List.of() : ctx.entityTerms();
+        String ask = "Question: " + Optional.ofNullable(question).orElse("") + "\n" +
+                (entityTerms.isEmpty() ? "" : ("Key terms: " + String.join(", ", entityTerms) + "\n")) +
+                (evidence.isBlank() ? "" : ("Evidence:\n" + evidence + "\n")) +
+                "Return JSON with keys roadmap (array of concise steps) and key_info (array of short facts). " +
+                "Limit roadmap to " + MAX_ROADMAP_STEPS + " items and key_info to " + MAX_KEY_INFO + " items.";
+
+        try {
+            String content = chatClient.prompt()
+                    .system(ROADMAP_SYSTEM_PROMPT)
+                    .user(ask)
+                    .call()
+                    .content();
+
+            RoadmapInfo parsed = parseRoadmapInfo(content);
+            if (parsed != null) return parsed;
+            return fallbackRoadmapInfo(content, evidence);
+        } catch (Exception ex) {
+            return fallbackRoadmapInfo("roadmap_failed: " + safeMsg(ex), evidence);
+        }
+    }
+
+    private RoadmapInfo parseRoadmapInfo(String content) {
+        if (content == null || content.isBlank()) return null;
+        try {
+            JsonNode root = OM.readTree(content);
+            List<String> steps = readStringArray(root, "roadmap", "steps", MAX_ROADMAP_STEPS);
+            List<String> keyInfo = readStringArray(root, "key_info", "keyInfo", MAX_KEY_INFO);
+            return new RoadmapInfo(steps, keyInfo, content);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private RoadmapInfo fallbackRoadmapInfo(String raw, String evidence) {
+        List<String> steps = List.of(
+                "Check question scope and intent",
+                "Review available evidence",
+                "Answer concisely with grounded facts"
+        );
+        List<String> keyInfo = extractKeyInfo(evidence, MAX_KEY_INFO);
+        return new RoadmapInfo(steps, keyInfo, raw);
+    }
+
+    private List<String> readStringArray(JsonNode root, String key, String fallbackKey, int limit) {
+        if (root == null) return List.of();
+        JsonNode node = root.path(key);
+        if (node.isMissingNode() && fallbackKey != null) {
+            node = root.path(fallbackKey);
+        }
+        if (!node.isArray()) return List.of();
+        List<String> out = new ArrayList<>();
+        for (JsonNode item : node) {
+            if (out.size() >= limit) break;
+            String value = item.asText("").trim();
+            if (!value.isBlank()) out.add(value);
+        }
+        return out;
+    }
+
+    private List<String> extractKeyInfo(String evidence, int limit) {
+        if (evidence == null || evidence.isBlank() || limit <= 0) return List.of();
+        List<String> out = new ArrayList<>();
+        String[] lines = evidence.split("\\r?\\n");
+        for (String line : lines) {
+            if (out.size() >= limit) break;
+            String trimmed = line.trim();
+            if (trimmed.isBlank()) continue;
+            if (trimmed.startsWith("-") || trimmed.startsWith("•") || trimmed.startsWith("*")) {
+                trimmed = trimmed.substring(1).trim();
+            }
+            if (!trimmed.isBlank()) out.add(trimmed);
+        }
+        if (!out.isEmpty()) return out;
+
+        String[] sentences = evidence.split("[。.!?]\\s*");
+        for (String sentence : sentences) {
+            if (out.size() >= limit) break;
+            String trimmed = sentence.trim();
+            if (!trimmed.isBlank()) out.add(trimmed);
+        }
+        return out;
     }
 
     // --------------------------
