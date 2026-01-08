@@ -7,16 +7,22 @@ import java.util.*;
 /**
  * Request payload for generating an answer with RAG context.
  *
- * @param question   user question
- * @param sessionId  chat session id for memory separation
- * @param topK       optional override for retrieval topK
- * @param minScore   optional override for retrieval minScore
- * @param model      optional model name hint (e.g. "deepseek", "openai")
+ * @param question     user question
+ * @param sessionId    chat session id for memory separation
+ * @param deepThinking whether to enable enhanced reasoning and helper steps
+ * @param scopeMode    scope mode for privacy/scope checks
+ * @param topK         optional override for retrieval topK
+ * @param minScore     optional override for retrieval minScore
+ * @param model        optional model name hint (e.g. "deepseek", "openai")
  * @param toolProfile  optional tool profile (e.g. "BASIC_CHAT", "ADMIN", "FULL")
+ * @param fileUrls     optional external file URLs for attachment
+ * @param visionModel  optional vision model key
  */
 public record RagAnswerRequest(
         String question,
         String sessionId,
+        Boolean deepThinking,
+        ScopeMode scopeMode,
         Integer topK,
         Double minScore,
         String model,
@@ -26,6 +32,12 @@ public record RagAnswerRequest(
 ) {
     private static final Set<String> models = Set.of("deepseek", "gemini", "openai");
     public static final String DEFAULT_MODEL = "deepseek";
+    public static final ScopeMode DEFAULT_SCOPE_MODE = ScopeMode.PRIVACY_SAFE;
+
+    public enum ScopeMode {
+        PRIVACY_SAFE,
+        YUQI_ONLY
+    }
 
     public int resolveTopK(int defaultValue) {
         return topK == null || topK <= 0 ? defaultValue : topK;
@@ -35,6 +47,14 @@ public record RagAnswerRequest(
         return minScore == null ? defaultValue : minScore;
     }
 
+    public boolean resolveDeepThinking(boolean defaultValue) {
+        return deepThinking != null && deepThinking;
+    }
+
+    public ScopeMode resolveScopeMode() {
+        return scopeMode == null ? DEFAULT_SCOPE_MODE : scopeMode;
+    }
+
     public String resolveModel() {
         return (model == null || model.isBlank()
         || !models.contains(model)) ? DEFAULT_MODEL : model;
@@ -42,12 +62,13 @@ public record RagAnswerRequest(
 
     public List<String> resolveFileUrls(int maxFiles) {
         if (this.fileUrls == null) return List.of();
+        int limit = Math.min(Math.max(0, maxFiles), 3);
         return this.fileUrls.stream()
                 .filter(Objects::nonNull)
                 .map(String::trim)
                 .filter(s -> !s.isBlank())
                 .distinct()
-                .limit(Math.max(0, 3))
+                .limit(limit)
                 .toList();
     }
 
