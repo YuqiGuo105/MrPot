@@ -1089,60 +1089,73 @@ public class RagAnswerService {
                                                           Mono<List<String>> keyInfoMono,
                                                           Mono<EvidenceGapTools.EvidenceGapResult> gapMono,
                                                           Mono<AnswerOutlineTools.OutlineResult> outlineMono) {
-        return Mono.zip(retrievalMono, fileTextMono, scopeGuardMono, entityResolveMono, compressedMono, sanitizedMono, keyInfoMono, gapMono, outlineMono)
-                .map(tuple -> {
-                    RagRetrievalResult retrieval = tuple.getT1();
-                    String fileText = tuple.getT2();
-                    ScopeGuardTools.ScopeGuardResult guard = tuple.getT3();
-                    EntityResolveTools.EntityResolveResult entity = tuple.getT4();
-                    String compressed = tuple.getT5();
-                    SanitizedEvidence sanitized = tuple.getT6();
-                    List<String> keyInfo = tuple.getT7();
-                    EvidenceGapTools.EvidenceGapResult gapResult = tuple.getT8();
-                    AnswerOutlineTools.OutlineResult outlineResult = tuple.getT9();
+        return Mono.zip(
+                        new Mono<?>[]{
+                                retrievalMono,
+                                fileTextMono,
+                                scopeGuardMono,
+                                entityResolveMono,
+                                compressedMono,
+                                sanitizedMono,
+                                keyInfoMono,
+                                gapMono,
+                                outlineMono
+                        },
+                        tuple -> {
+                            RagRetrievalResult retrieval = (RagRetrievalResult) tuple[0];
+                            String fileText = (String) tuple[1];
+                            ScopeGuardTools.ScopeGuardResult guard = (ScopeGuardTools.ScopeGuardResult) tuple[2];
+                            EntityResolveTools.EntityResolveResult entity = (EntityResolveTools.EntityResolveResult) tuple[3];
+                            String compressed = (String) tuple[4];
+                            SanitizedEvidence sanitized = (SanitizedEvidence) tuple[5];
+                            @SuppressWarnings("unchecked")
+                            List<String> keyInfo = (List<String>) tuple[6];
+                            EvidenceGapTools.EvidenceGapResult gapResult = (EvidenceGapTools.EvidenceGapResult) tuple[7];
+                            AnswerOutlineTools.OutlineResult outlineResult = (AnswerOutlineTools.OutlineResult) tuple[8];
 
-                    boolean outOfScopeKb = isOutOfScope(retrieval);
-                    boolean hasAnyRef = hasAnyReference(retrieval, fileText);
+                            boolean outOfScopeKb = isOutOfScope(retrieval);
+                            boolean hasAnyRef = hasAnyReference(retrieval, fileText);
 
-                    if (deepThinking) {
-                        if (guard != null && !guard.scoped()) {
-                            outOfScopeKb = true;
-                            hasAnyRef = false;
+                            if (deepThinking) {
+                                if (guard != null && !guard.scoped()) {
+                                    outOfScopeKb = true;
+                                    hasAnyRef = false;
+                                }
+                                if (!compressed.isBlank()) {
+                                    hasAnyRef = true;
+                                }
+                            }
+
+                            if (scopeMode == RagAnswerRequest.ScopeMode.YUQI_ONLY && (guard == null || !guard.scoped())) {
+                                outOfScopeKb = true;
+                                hasAnyRef = false;
+                            }
+
+                            List<String> entityTerms = (entity == null || entity.terms() == null)
+                                    ? List.of()
+                                    : entity.terms();
+
+                            RagRetrievalResult sanitizedRetrieval = new RagRetrievalResult(
+                                    retrieval.question(),
+                                    retrieval.documents(),
+                                    sanitized.context()
+                            );
+
+                            return new PreparedContext(
+                                    sanitizedRetrieval,
+                                    sanitized.fileText(),
+                                    outOfScopeKb,
+                                    hasAnyRef,
+                                    guard,
+                                    entityTerms,
+                                    compressed,
+                                    sanitized,
+                                    keyInfo == null ? List.of() : keyInfo,
+                                    gapResult == null ? new EvidenceGapTools.EvidenceGapResult(List.of(), List.of(), "skipped") : gapResult,
+                                    outlineResult == null ? new AnswerOutlineTools.OutlineResult(List.of(), "bullets") : outlineResult
+                            );
                         }
-                        if (!compressed.isBlank()) {
-                            hasAnyRef = true;
-                        }
-                    }
-
-                    if (scopeMode == RagAnswerRequest.ScopeMode.YUQI_ONLY && (guard == null || !guard.scoped())) {
-                        outOfScopeKb = true;
-                        hasAnyRef = false;
-                    }
-
-                    List<String> entityTerms = (entity == null || entity.terms() == null)
-                            ? List.of()
-                            : entity.terms();
-
-                    RagRetrievalResult sanitizedRetrieval = new RagRetrievalResult(
-                            retrieval.question(),
-                            retrieval.documents(),
-                            sanitized.context()
-                    );
-
-                    return new PreparedContext(
-                            sanitizedRetrieval,
-                            sanitized.fileText(),
-                            outOfScopeKb,
-                            hasAnyRef,
-                            guard,
-                            entityTerms,
-                            compressed,
-                            sanitized,
-                            keyInfo == null ? List.of() : keyInfo,
-                            gapResult == null ? new EvidenceGapTools.EvidenceGapResult(List.of(), List.of(), "skipped") : gapResult,
-                            outlineResult == null ? new AnswerOutlineTools.OutlineResult(List.of(), "bullets") : outlineResult
-                    );
-                });
+                );
     }
 
     private List<String> extractKeyInfo(String evidence, int limit) {
