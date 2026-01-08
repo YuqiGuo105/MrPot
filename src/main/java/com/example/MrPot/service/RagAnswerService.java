@@ -1162,15 +1162,21 @@ public class RagAnswerService {
                 continue;
             }
 
-            if (!safeList(f.keywords()).isEmpty()) {
+            List<String> keywords = safeList(f.keywords());
+            List<String> queries = safeList(f.queries());
+            String txt = safeText(f.keyText());
+
+            if (!keywords.isEmpty()) {
                 sb.append("  keywords: ").append(String.join(", ", uniqLimit(f.keywords(), 12))).append("\n");
             }
-            if (!safeList(f.queries()).isEmpty()) {
+            if (!queries.isEmpty()) {
                 sb.append("  queries: ").append(String.join(" | ", uniqLimit(f.queries(), 6))).append("\n");
             }
-            String txt = safeText(f.keyText());
             if (!txt.isBlank()) {
                 sb.append("  text: ").append(truncate(txt, 900)).append("\n");
+            }
+            if (txt.isBlank() && keywords.isEmpty() && queries.isEmpty() && isImageMime(f.mime())) {
+                sb.append("  note: image provided; no readable text extracted.\n");
             }
             sb.append("\n");
 
@@ -1187,6 +1193,10 @@ public class RagAnswerService {
 
     private static String safe(String s, String d) {
         return (s == null || s.isBlank()) ? d : s;
+    }
+
+    private static boolean isImageMime(String mime) {
+        return mime != null && mime.toLowerCase(Locale.ROOT).startsWith("image/");
     }
 
     private static boolean hasAnyReference(RagRetrievalResult retrieval, String fileText) {
