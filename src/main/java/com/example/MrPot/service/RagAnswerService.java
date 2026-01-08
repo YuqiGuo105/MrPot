@@ -13,6 +13,7 @@ import com.example.MrPot.tools.PrivacySanitizerTools;
 import com.example.MrPot.tools.QuestionDecomposerTools;
 import com.example.MrPot.tools.RoadmapPlannerTools;
 import com.example.MrPot.tools.ScopeGuardTools;
+import com.example.MrPot.tools.TrackCorrectTools;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -49,6 +50,7 @@ public class RagAnswerService {
     private final EvidenceRerankTools evidenceRerankTools;
     private final ConflictDetectTools conflictDetectTools;
     private final CodeSearchTools codeSearchTools;
+    private final TrackCorrectTools trackCorrectTools;
     private final RedisChatMemoryService chatMemoryService;
     private final Map<String, ChatClient> chatClients;
 
@@ -347,6 +349,8 @@ public class RagAnswerService {
         Mono<RagRetrievalResult> retrievalFinalMono = refineRetrievalMono(
                 request.question(), topK, minScore, filesMono, entityResolveMono, retrieval0Mono);
 
+        Mono<List<KbDocument>> kbDocsMono = buildKbDocumentsMono(retrievalFinalMono);
+
         Mono<SanitizedEvidence> sanitizeMono = buildSanitizedEvidenceMono(retrievalFinalMono, fileTextMono);
 
         Mono<String> compressedMono = buildCompressedMono(request, deepThinking, roadmapPlanMono, retrievalFinalMono, sanitizeMono);
@@ -361,6 +365,20 @@ public class RagAnswerService {
                 compressedMono,
                 sanitizeMono
         ).cache();
+
+        Mono<TrackCorrectTools.TrackResult> trackCorrectMono = Mono.zip(roadmapPlanMono, preparedContextMono)
+                .flatMap(tuple -> {
+                    RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
+                    PreparedContext ctx = tuple.getT2();
+                    String status = ctx.hasAnyRef ? "" : "no_evidence";
+                    if (ctx.scopeGuardResult != null && !ctx.scopeGuardResult.scoped()) {
+                        status = "out_of_scope";
+                    }
+                    String roadmapSummary = String.join(" -> ", plan.steps());
+                    return Mono.fromCallable(() -> trackCorrectTools.ensure(request.question(), roadmapSummary, status))
+                            .subscribeOn(Schedulers.boundedElastic());
+                })
+                .cache();
 
         Flux<ThinkingEvent> startStep = Flux.just(
                 new ThinkingEvent("start", "Init", Map.of("ts", System.currentTimeMillis()))
@@ -429,6 +447,18 @@ public class RagAnswerService {
                 ))
         ) : Flux.empty();
 
+        Flux<ThinkingEvent> trackCorrectStep = deepThinking ? trackCorrectMono.flatMapMany(result ->
+                Flux.just(new ThinkingEvent(
+                        "track_correct",
+                        "Track correction",
+                        Map.of(
+                                "onTrack", result.onTrack(),
+                                "status", result.status(),
+                                "hint", result.hint()
+                        )
+                ))
+        ) : Flux.empty();
+
         Flux<ThinkingEvent> entityResolveStep = deepThinking
                 ? Mono.zip(roadmapPlanMono, entityResolveMono).flatMapMany(tuple -> {
                     RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
@@ -460,6 +490,17 @@ public class RagAnswerService {
             if (!plan.useKb()) return Flux.empty();
             return Flux.just(new ThinkingEvent("rag", "Retrieval", summarizeRetrieval(retrieval)));
         });
+
+        Flux<ThinkingEvent> kbDocsStep = deepThinking ? kbDocsMono.flatMapMany(docs ->
+                Flux.just(new ThinkingEvent(
+                        "kb_docs",
+                        "KB documents",
+                        Map.of(
+                                "count", docs.size(),
+                                "ids", docs.stream().map(KbDocument::getId).filter(Objects::nonNull).toList()
+                        )
+                ))
+        ) : Flux.empty();
 
         Flux<ThinkingEvent> contextCompressStep = deepThinking
                 ? Mono.zip(roadmapPlanMono, compressedMono).flatMapMany(tuple -> {
@@ -619,12 +660,14 @@ public class RagAnswerService {
                 fileFetchStep,
                 fileExtractStep,
                 scopeGuardStep,
+                trackCorrectStep,
                 entityResolveStep,
                 codeSearchStep,
                 privacyStep,
                 evidenceStep,
                 redisStep,
                 ragStep,
+                kbDocsStep,
                 contextCompressStep,
                 keyInfoStep,
                 conflictStep,
@@ -830,6 +873,21 @@ public class RagAnswerService {
                     Map<String, Integer> hits = mergeHits(sanitizedContext.hits(), sanitizedFile.hits());
                     return new SanitizedEvidence(sanitizedContext.sanitized(), sanitizedFile.sanitized(), hits);
                 })
+                .cache();
+    }
+
+    private Mono<List<KbDocument>> buildKbDocumentsMono(Mono<RagRetrievalResult> retrievalMono) {
+        return retrievalMono
+                .map(retrieval -> {
+                    if (retrieval == null || retrieval.documents() == null || retrieval.documents().isEmpty()) {
+                        return List.<KbDocument>of();
+                    }
+                    return retrieval.documents().stream()
+                            .map(ScoredDocument::document)
+                            .filter(Objects::nonNull)
+                            .toList();
+                })
+                .defaultIfEmpty(List.<KbDocument>of())
                 .cache();
     }
 

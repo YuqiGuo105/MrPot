@@ -32,7 +32,7 @@ public class EvidenceRerankTools {
 
     private double overlapScore(ScoredDocument doc, List<String> terms) {
         if (doc == null || doc.document() == null || terms == null || terms.isEmpty()) return 0.0;
-        String text = (doc.document().content() == null ? "" : doc.document().content()).toLowerCase(Locale.ROOT);
+        String text = (doc.document().getContent() == null ? "" : doc.document().getContent()).toLowerCase(Locale.ROOT);
         double score = 0.0;
         for (String term : terms) {
             if (term == null || term.isBlank()) continue;
