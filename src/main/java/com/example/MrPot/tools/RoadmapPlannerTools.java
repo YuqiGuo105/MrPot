@@ -6,7 +6,6 @@ import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.regex.Pattern;
 
 @Component
@@ -15,6 +14,7 @@ public class RoadmapPlannerTools {
     private static final Pattern YUQI_PATTERN = Pattern.compile("(yuqi|\\u90ed\\u5b87\\u7426|\\u4e8e\\u742a|\\u90ed\\u745c\\u7426)", Pattern.CASE_INSENSITIVE);
     private static final Pattern COMMON_SENSE_HINT = Pattern.compile("(what|why|how|explain|define|\\u4ec0\\u4e48|\\u89e3\\u91ca|\\u4e3a\\u4ec0\\u4e48|\\u600e\\u4e48)", Pattern.CASE_INSENSITIVE);
     private static final Pattern CODE_HINT = Pattern.compile("(code|bug|stacktrace|traceback|exception|api|endpoint|class|method|java|spring|yaml|config|\\u4ee3\\u7801)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern COMPLEX_HINT = Pattern.compile("(\\band\\b|\\bor\\b|\\bvs\\b|\\bversus\\b|\\bcompare\\b|,|;|\\n|/)", Pattern.CASE_INSENSITIVE);
 
     public record RoadmapPlan(
             List<String> steps,
@@ -26,7 +26,10 @@ public class RoadmapPlannerTools {
             boolean useCompress,
             boolean useVerify,
             boolean useConflictDetect,
-            boolean useCodeSearch
+            boolean useCodeSearch,
+            boolean useQuestionDecompose,
+            boolean useEvidenceGap,
+            boolean useAnswerOutline
     ) {}
 
     @Tool(name = "roadmap_plan", description = "Plan which tools to use and which to skip for deep thinking.")
@@ -47,17 +50,27 @@ public class RoadmapPlannerTools {
         boolean useVerify = deepThinking;
         boolean useConflictDetect = deepThinking && useKb && useFiles;
         boolean useCodeSearch = deepThinking && isCode;
+        boolean useQuestionDecompose = deepThinking && isComplexQuestion(q);
+        boolean useEvidenceGap = deepThinking;
+        boolean useAnswerOutline = deepThinking;
 
         steps.add("scope_guard");
+        if (useQuestionDecompose) steps.add("question_decompose");
         if (useKb) steps.add("kb_search");
         if (useFiles) steps.add("file_fetch");
         if (useEntityResolve) steps.add("entity_resolve");
         steps.add("privacy_sanitize");
         if (useCompress) steps.add("context_compress");
         if (useCodeSearch) steps.add("code_search");
+        if (useEvidenceGap) steps.add("evidence_gap");
+        if (useAnswerOutline) steps.add("answer_outline");
         if (useConflictDetect) steps.add("conflict_detect");
         if (useVerify) steps.add("answer_verify");
 
+        if (!useQuestionDecompose) {
+            skips.add("question_decompose");
+            rationale.add("question short/simple -> skip decomposition");
+        }
         if (!useKb) {
             skips.add("kb_search");
             rationale.add("common_sense_question -> skip KB");
@@ -78,6 +91,14 @@ public class RoadmapPlannerTools {
             skips.add("code_search");
             rationale.add("question not code-related");
         }
+        if (!useEvidenceGap) {
+            skips.add("evidence_gap");
+            rationale.add("gap check only for deep thinking mode");
+        }
+        if (!useAnswerOutline) {
+            skips.add("answer_outline");
+            rationale.add("outline only for deep thinking mode");
+        }
         if (!useConflictDetect) {
             skips.add("conflict_detect");
             rationale.add("conflict detection requires both KB and file evidence");
@@ -87,6 +108,33 @@ public class RoadmapPlannerTools {
             rationale.add("YUQI_ONLY mode -> out of scope unless explicitly about Yuqi");
         }
 
-        return new RoadmapPlan(steps, skips, rationale, useKb, useFiles, useEntityResolve, useCompress, useVerify, useConflictDetect, useCodeSearch);
+        return new RoadmapPlan(
+                steps,
+                skips,
+                rationale,
+                useKb,
+                useFiles,
+                useEntityResolve,
+                useCompress,
+                useVerify,
+                useConflictDetect,
+                useCodeSearch,
+                useQuestionDecompose,
+                useEvidenceGap,
+                useAnswerOutline
+        );
+    }
+
+    private boolean isComplexQuestion(String question) {
+        if (question == null) return false;
+        String q = question.trim();
+        if (q.length() >= 160) return true;
+        if (COMPLEX_HINT.matcher(q).find()) return true;
+        int questionMarks = 0;
+        for (char ch : q.toCharArray()) {
+            if (ch == '?' || ch == '？') questionMarks++;
+            if (questionMarks >= 2) return true;
+        }
+        return false;
     }
 }
