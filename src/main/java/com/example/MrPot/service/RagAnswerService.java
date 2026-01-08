@@ -370,10 +370,8 @@ public class RagAnswerService {
                 .flatMap(tuple -> {
                     RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
                     PreparedContext ctx = tuple.getT2();
-                    String status = ctx.hasAnyRef ? "" : "no_evidence";
-                    if (ctx.scopeGuardResult != null && !ctx.scopeGuardResult.scoped()) {
-                        status = "out_of_scope";
-                    }
+                    boolean outOfScope = ctx.scopeGuardResult != null && !ctx.scopeGuardResult.scoped();
+                    String status = outOfScope ? "out_of_scope" : (ctx.hasAnyRef ? "" : "no_evidence");
                     String roadmapSummary = String.join(" -> ", plan.steps());
                     return Mono.fromCallable(() -> trackCorrectTools.ensure(request.question(), roadmapSummary, status))
                             .subscribeOn(Schedulers.boundedElastic());
