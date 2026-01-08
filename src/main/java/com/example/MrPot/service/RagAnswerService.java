@@ -315,7 +315,7 @@ public class RagAnswerService {
         }).cache();
 
         Mono<List<FileItem>> filesMono = roadmapPlanMono.flatMap(plan ->
-                plan.useFiles() ? extractFilesMono(urls) : Mono.just(List.of())
+                plan.useFiles() ? extractFilesMono(urls) : Mono.just(List.<FileItem>of())
         ).cache();
         Mono<FileInsights> fileInsightsMono = filesMono.map(this::summarizeFileInsights).cache();
         Mono<String> fileTextMono = fileInsightsMono.map(FileInsights::promptContext).defaultIfEmpty("").cache();
@@ -691,7 +691,7 @@ public class RagAnswerService {
                 : Mono.just(defaultRoadmapPlan(!urls.isEmpty()));
 
         Mono<List<FileItem>> filesMono = roadmapPlanMono.flatMap(plan ->
-                plan.useFiles() ? extractFilesMono(urls) : Mono.just(List.of())
+                plan.useFiles() ? extractFilesMono(urls) : Mono.just(List.<FileItem>of())
         ).cache();
         Mono<FileInsights> fileInsightsMono = filesMono.map(this::summarizeFileInsights).cache();
         Mono<String> fileTextMono = fileInsightsMono.map(FileInsights::promptContext).defaultIfEmpty("").cache();
