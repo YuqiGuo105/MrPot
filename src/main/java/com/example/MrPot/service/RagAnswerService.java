@@ -1090,7 +1090,7 @@ public class RagAnswerService {
                                                           Mono<EvidenceGapTools.EvidenceGapResult> gapMono,
                                                           Mono<AnswerOutlineTools.OutlineResult> outlineMono) {
         return Mono.zip(
-                        new Mono<?>[]{
+                        List.of(
                                 retrievalMono,
                                 fileTextMono,
                                 scopeGuardMono,
@@ -1100,7 +1100,7 @@ public class RagAnswerService {
                                 keyInfoMono,
                                 gapMono,
                                 outlineMono
-                        },
+                        ),
                         tuple -> {
                             RagRetrievalResult retrieval = (RagRetrievalResult) tuple[0];
                             String fileText = (String) tuple[1];
