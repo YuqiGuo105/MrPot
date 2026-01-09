@@ -1,10 +1,12 @@
 package com.example.MrPot.service;
 
 import com.example.MrPot.model.*;
+import com.example.MrPot.tools.ActionPlanTools;
+import com.example.MrPot.tools.AnswerOutlineTools;
+import com.example.MrPot.tools.AssumptionCheckTools;
 import com.example.MrPot.tools.CodeSearchTools;
 import com.example.MrPot.tools.ConflictDetectTools;
 import com.example.MrPot.tools.ContextCompressTools;
-import com.example.MrPot.tools.AnswerOutlineTools;
 import com.example.MrPot.tools.EntityResolveTools;
 import com.example.MrPot.tools.EvidenceGapTools;
 import com.example.MrPot.tools.EvidenceRerankTools;
@@ -55,6 +57,8 @@ public class RagAnswerService {
     private final TrackCorrectTools trackCorrectTools;
     private final EvidenceGapTools evidenceGapTools;
     private final AnswerOutlineTools answerOutlineTools;
+    private final AssumptionCheckTools assumptionCheckTools;
+    private final ActionPlanTools actionPlanTools;
     private final RedisChatMemoryService chatMemoryService;
     private final Map<String, ChatClient> chatClients;
 
@@ -125,7 +129,9 @@ public class RagAnswerService {
             SanitizedEvidence sanitizedEvidence,
             List<String> keyInfo,
             EvidenceGapTools.EvidenceGapResult evidenceGap,
-            AnswerOutlineTools.OutlineResult answerOutline
+            AnswerOutlineTools.OutlineResult answerOutline,
+            AssumptionCheckTools.AssumptionResult assumptionResult,
+            ActionPlanTools.ActionPlanResult actionPlan
     ) { }
 
     private record SanitizedEvidence(
@@ -185,7 +191,9 @@ public class RagAnswerService {
                         new SanitizedEvidence("", "", Map.of()),
                         List.of(),
                         new EvidenceGapTools.EvidenceGapResult(List.of(), List.of(), "skipped"),
-                        new AnswerOutlineTools.OutlineResult(List.of(), "bullets")
+                        new AnswerOutlineTools.OutlineResult(List.of(), "bullets"),
+                        new AssumptionCheckTools.AssumptionResult(List.of(), "low"),
+                        new ActionPlanTools.ActionPlanResult(List.of(), "bullets")
                 ));
 
         ChatClient chatClient = resolveClient(model);
@@ -207,7 +215,9 @@ public class RagAnswerService {
                 ctx.compressedContext,
                 ctx.keyInfo,
                 ctx.evidenceGap,
-                ctx.answerOutline
+                ctx.answerOutline,
+                ctx.assumptionResult,
+                ctx.actionPlan
         );
 
         String answer;
@@ -270,7 +280,9 @@ public class RagAnswerService {
                                     ctx.compressedContext,
                                     ctx.keyInfo,
                                     ctx.evidenceGap,
-                                    ctx.answerOutline
+                                    ctx.answerOutline,
+                                    ctx.assumptionResult,
+                                    ctx.actionPlan
                             );
 
                     AtomicReference<StringBuilder> aggregate = new AtomicReference<>(new StringBuilder());
@@ -428,6 +440,30 @@ public class RagAnswerService {
                 })
                 .cache();
 
+        Mono<AssumptionCheckTools.AssumptionResult> assumptionMono = Mono.zip(roadmapPlanMono, sanitizeMono)
+                .flatMap(tuple -> {
+                    RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
+                    SanitizedEvidence sanitized = tuple.getT2();
+                    if (!deepThinking || !plan.useAssumptionCheck()) {
+                        return Mono.just(new AssumptionCheckTools.AssumptionResult(List.of(), "low"));
+                    }
+                    return Mono.fromCallable(() -> assumptionCheckTools.check(request.question(), sanitized.combined()))
+                            .subscribeOn(Schedulers.boundedElastic());
+                })
+                .cache();
+
+        Mono<ActionPlanTools.ActionPlanResult> actionPlanMono = Mono.zip(roadmapPlanMono, keyInfoMono)
+                .flatMap(tuple -> {
+                    RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
+                    List<String> keyInfo = tuple.getT2();
+                    if (!deepThinking || !plan.useActionPlan()) {
+                        return Mono.just(new ActionPlanTools.ActionPlanResult(List.of(), "bullets"));
+                    }
+                    return Mono.fromCallable(() -> actionPlanTools.plan(request.question(), keyInfo))
+                            .subscribeOn(Schedulers.boundedElastic());
+                })
+                .cache();
+
         Mono<PreparedContext> preparedContextMono = assemblePreparedContext(
                 deepThinking,
                 scopeMode,
@@ -439,7 +475,9 @@ public class RagAnswerService {
                 sanitizeMono,
                 keyInfoMono,
                 gapMono,
-                outlineMono
+                outlineMono,
+                assumptionMono,
+                actionPlanMono
         ).cache();
 
         Mono<TrackCorrectTools.TrackResult> trackCorrectMono = Mono.zip(roadmapPlanMono, preparedContextMono)
@@ -473,8 +511,8 @@ public class RagAnswerService {
         Flux<ThinkingEvent> deepThinkStep = Flux.defer(() -> {
             if (!deepThinking) return Flux.empty();
             return Flux.just(new ThinkingEvent(
-                    "deep_think_mode",
-                    "Deep thinking mode",
+                    "deep_mode",
+                    "Thinking",
                     Map.of("enabled", true)
             ));
         });
@@ -654,6 +692,22 @@ public class RagAnswerService {
                 ))
         ) : Flux.empty();
 
+        Flux<ThinkingEvent> assumptionCheckStep = deepThinking ? assumptionMono.flatMapMany(result ->
+                Flux.just(new ThinkingEvent(
+                        "assumption_check",
+                        "Assumption check",
+                        Map.of("risk", result.riskLevel(), "assumptions", result.assumptions())
+                ))
+        ) : Flux.empty();
+
+        Flux<ThinkingEvent> actionPlanStep = deepThinking ? actionPlanMono.flatMapMany(result ->
+                Flux.just(new ThinkingEvent(
+                        "action_plan",
+                        "Action plan",
+                        Map.of("style", result.style(), "steps", result.steps())
+                ))
+        ) : Flux.empty();
+
         Mono<ConflictDetectTools.ConflictResult> conflictMono = Mono.zip(roadmapPlanMono, sanitizeMono)
                 .flatMap(tuple -> {
                     RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
@@ -700,7 +754,9 @@ public class RagAnswerService {
                                     ctx.compressedContext,
                                     ctx.keyInfo,
                                     ctx.evidenceGap,
-                                    ctx.answerOutline
+                                    ctx.answerOutline,
+                                    ctx.assumptionResult,
+                                    ctx.actionPlan
                             );
                             promptRef.set(prompt);
 
@@ -784,6 +840,8 @@ public class RagAnswerService {
                 keyInfoStep,
                 evidenceGapStep,
                 answerOutlineStep,
+                assumptionCheckStep,
+                actionPlanStep,
                 conflictStep,
                 answerDeltaStep,
                 answerVerifyStep,
@@ -892,6 +950,30 @@ public class RagAnswerService {
                 })
                 .cache();
 
+        Mono<AssumptionCheckTools.AssumptionResult> assumptionMono = Mono.zip(roadmapPlanMono, sanitizeMono)
+                .flatMap(tuple -> {
+                    RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
+                    SanitizedEvidence sanitized = tuple.getT2();
+                    if (!deepThinking || !plan.useAssumptionCheck()) {
+                        return Mono.just(new AssumptionCheckTools.AssumptionResult(List.of(), "low"));
+                    }
+                    return Mono.fromCallable(() -> assumptionCheckTools.check(request.question(), sanitized.combined()))
+                            .subscribeOn(Schedulers.boundedElastic());
+                })
+                .cache();
+
+        Mono<ActionPlanTools.ActionPlanResult> actionPlanMono = Mono.zip(roadmapPlanMono, keyInfoMono)
+                .flatMap(tuple -> {
+                    RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
+                    List<String> keyInfo = tuple.getT2();
+                    if (!deepThinking || !plan.useActionPlan()) {
+                        return Mono.just(new ActionPlanTools.ActionPlanResult(List.of(), "bullets"));
+                    }
+                    return Mono.fromCallable(() -> actionPlanTools.plan(request.question(), keyInfo))
+                            .subscribeOn(Schedulers.boundedElastic());
+                })
+                .cache();
+
         return assemblePreparedContext(
                 deepThinking,
                 scopeMode,
@@ -903,7 +985,9 @@ public class RagAnswerService {
                 sanitizeMono,
                 keyInfoMono,
                 gapMono,
-                outlineMono
+                outlineMono,
+                assumptionMono,
+                actionPlanMono
         );
     }
 
@@ -1088,7 +1172,9 @@ public class RagAnswerService {
                                                           Mono<SanitizedEvidence> sanitizedMono,
                                                           Mono<List<String>> keyInfoMono,
                                                           Mono<EvidenceGapTools.EvidenceGapResult> gapMono,
-                                                          Mono<AnswerOutlineTools.OutlineResult> outlineMono) {
+                                                          Mono<AnswerOutlineTools.OutlineResult> outlineMono,
+                                                          Mono<AssumptionCheckTools.AssumptionResult> assumptionMono,
+                                                          Mono<ActionPlanTools.ActionPlanResult> actionPlanMono) {
         return Mono.zip(
                         List.of(
                                 retrievalMono,
@@ -1099,7 +1185,9 @@ public class RagAnswerService {
                                 sanitizedMono,
                                 keyInfoMono,
                                 gapMono,
-                                outlineMono
+                                outlineMono,
+                                assumptionMono,
+                                actionPlanMono
                         ),
                         tuple -> {
                             RagRetrievalResult retrieval = (RagRetrievalResult) tuple[0];
@@ -1112,6 +1200,8 @@ public class RagAnswerService {
                             List<String> keyInfo = (List<String>) tuple[6];
                             EvidenceGapTools.EvidenceGapResult gapResult = (EvidenceGapTools.EvidenceGapResult) tuple[7];
                             AnswerOutlineTools.OutlineResult outlineResult = (AnswerOutlineTools.OutlineResult) tuple[8];
+                            AssumptionCheckTools.AssumptionResult assumptionResult = (AssumptionCheckTools.AssumptionResult) tuple[9];
+                            ActionPlanTools.ActionPlanResult actionPlanResult = (ActionPlanTools.ActionPlanResult) tuple[10];
 
                             boolean outOfScopeKb = isOutOfScope(retrieval);
                             boolean hasAnyRef = hasAnyReference(retrieval, fileText);
@@ -1148,12 +1238,14 @@ public class RagAnswerService {
                                     hasAnyRef,
                                     guard,
                                     entityTerms,
-                                    compressed,
-                                    sanitized,
-                                    keyInfo == null ? List.of() : keyInfo,
-                                    gapResult == null ? new EvidenceGapTools.EvidenceGapResult(List.of(), List.of(), "skipped") : gapResult,
-                                    outlineResult == null ? new AnswerOutlineTools.OutlineResult(List.of(), "bullets") : outlineResult
-                            );
+                            compressed,
+                            sanitized,
+                            keyInfo == null ? List.of() : keyInfo,
+                            gapResult == null ? new EvidenceGapTools.EvidenceGapResult(List.of(), List.of(), "skipped") : gapResult,
+                            outlineResult == null ? new AnswerOutlineTools.OutlineResult(List.of(), "bullets") : outlineResult,
+                            assumptionResult == null ? new AssumptionCheckTools.AssumptionResult(List.of(), "low") : assumptionResult,
+                            actionPlanResult == null ? new ActionPlanTools.ActionPlanResult(List.of(), "bullets") : actionPlanResult
+                    );
                         }
                 );
     }
@@ -1209,6 +1301,8 @@ public class RagAnswerService {
                 List.of(),
                 true,
                 hasFiles,
+                false,
+                false,
                 false,
                 false,
                 false,
@@ -1438,7 +1532,9 @@ public class RagAnswerService {
                 "",
                 List.of(),
                 new EvidenceGapTools.EvidenceGapResult(List.of(), List.of(), "skipped"),
-                new AnswerOutlineTools.OutlineResult(List.of(), "bullets")
+                new AnswerOutlineTools.OutlineResult(List.of(), "bullets"),
+                new AssumptionCheckTools.AssumptionResult(List.of(), "low"),
+                new ActionPlanTools.ActionPlanResult(List.of(), "bullets")
         );
     }
 
@@ -1455,7 +1551,9 @@ public class RagAnswerService {
                                String compressedContext,
                                List<String> keyInfo,
                                EvidenceGapTools.EvidenceGapResult evidenceGap,
-                               AnswerOutlineTools.OutlineResult answerOutline) {
+                               AnswerOutlineTools.OutlineResult answerOutline,
+                               AssumptionCheckTools.AssumptionResult assumptionResult,
+                               ActionPlanTools.ActionPlanResult actionPlan) {
 
         String rawContext = (retrieval == null) ? "" : Optional.ofNullable(retrieval.context()).orElse("");
         String contextText = compactLogContext(rawContext, MAX_CONTEXT_CHARS);
@@ -1536,6 +1634,24 @@ public class RagAnswerService {
             for (String section : answerOutline.sections()) {
                 if (section == null || section.isBlank()) continue;
                 sb.append("- ").append(section.trim()).append("\n");
+            }
+            sb.append("\n");
+        }
+
+        if (deepThinking && assumptionResult != null && assumptionResult.assumptions() != null && !assumptionResult.assumptions().isEmpty()) {
+            sb.append("Assumptions (risk=").append(assumptionResult.riskLevel()).append("):\n");
+            for (String assumption : assumptionResult.assumptions()) {
+                if (assumption == null || assumption.isBlank()) continue;
+                sb.append("- ").append(assumption.trim()).append("\n");
+            }
+            sb.append("\n");
+        }
+
+        if (deepThinking && actionPlan != null && actionPlan.steps() != null && !actionPlan.steps().isEmpty()) {
+            sb.append("Action plan (style=").append(actionPlan.style()).append("):\n");
+            for (String step : actionPlan.steps()) {
+                if (step == null || step.isBlank()) continue;
+                sb.append("- ").append(step.trim()).append("\n");
             }
             sb.append("\n");
         }

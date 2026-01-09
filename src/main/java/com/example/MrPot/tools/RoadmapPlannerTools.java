@@ -29,7 +29,9 @@ public class RoadmapPlannerTools {
             boolean useCodeSearch,
             boolean useQuestionDecompose,
             boolean useEvidenceGap,
-            boolean useAnswerOutline
+            boolean useAnswerOutline,
+            boolean useAssumptionCheck,
+            boolean useActionPlan
     ) {}
 
     @Tool(name = "roadmap_plan", description = "Plan which tools to use and which to skip for deep thinking.")
@@ -53,6 +55,8 @@ public class RoadmapPlannerTools {
         boolean useQuestionDecompose = deepThinking && isComplexQuestion(q);
         boolean useEvidenceGap = deepThinking;
         boolean useAnswerOutline = deepThinking;
+        boolean useAssumptionCheck = deepThinking;
+        boolean useActionPlan = deepThinking;
 
         steps.add("scope_guard");
         if (useQuestionDecompose) steps.add("question_decompose");
@@ -64,6 +68,8 @@ public class RoadmapPlannerTools {
         if (useCodeSearch) steps.add("code_search");
         if (useEvidenceGap) steps.add("evidence_gap");
         if (useAnswerOutline) steps.add("answer_outline");
+        if (useAssumptionCheck) steps.add("assumption_check");
+        if (useActionPlan) steps.add("action_plan");
         if (useConflictDetect) steps.add("conflict_detect");
         if (useVerify) steps.add("answer_verify");
 
@@ -103,6 +109,14 @@ public class RoadmapPlannerTools {
             skips.add("conflict_detect");
             rationale.add("conflict detection requires both KB and file evidence");
         }
+        if (!useAssumptionCheck) {
+            skips.add("assumption_check");
+            rationale.add("assumption check only for deep thinking mode");
+        }
+        if (!useActionPlan) {
+            skips.add("action_plan");
+            rationale.add("action plan only for deep thinking mode");
+        }
 
         if (scopeMode == RagAnswerRequest.ScopeMode.YUQI_ONLY && !mentionsYuqi) {
             rationale.add("YUQI_ONLY mode -> out of scope unless explicitly about Yuqi");
@@ -121,7 +135,9 @@ public class RoadmapPlannerTools {
                 useCodeSearch,
                 useQuestionDecompose,
                 useEvidenceGap,
-                useAnswerOutline
+                useAnswerOutline,
+                useAssumptionCheck,
+                useActionPlan
         );
     }
 
