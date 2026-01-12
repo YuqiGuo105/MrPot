@@ -134,3 +134,12 @@ cors:
   allowed-headers:
     - "*"
   allow-credentials: false
+
+app:
+  elastic:
+    base-url: ${ELASTICSEARCH_HOSTS}
+    username: ${ELASTICSEARCH_USERNAME}
+    password: ${ELASTICSEARCH_PASSWORD}
+  candidate:
+    store-to-es: true
+    es-index: ${CANDIDATE_ES_INDEX:mrpot_candidates}
