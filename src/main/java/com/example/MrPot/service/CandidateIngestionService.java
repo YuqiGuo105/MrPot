@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.ObjectProvider;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -19,7 +20,7 @@ import java.util.UUID;
 public class CandidateIngestionService {
 
     private final TempCandidateRepository tempRepo;
-    private final ElasticCandidateIndexer esIndexer;
+    private final ObjectProvider<ElasticCandidateIndexer> esIndexerProvider;
     private final ObjectMapper objectMapper;
 
     @Value("${app.candidate.store-to-es:true}")
@@ -69,7 +70,8 @@ public class CandidateIngestionService {
                 metaJson
         ));
 
-        if (storeToEs) {
+        ElasticCandidateIndexer esIndexer = esIndexerProvider.getIfAvailable();
+        if (storeToEs && esIndexer != null) {
             Map<String, Object> doc = new LinkedHashMap<>();
             doc.put("@timestamp", Instant.now().toString());
             doc.put("candidate_id", candidateId == null ? null : candidateId.toString());

@@ -1,6 +1,7 @@
 package com.example.MrPot.service;
 
 import lombok.RequiredArgsConstructor;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
@@ -11,6 +12,7 @@ import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
+@ConditionalOnBean(WebClient.class)
 public class ElasticCandidateIndexer {
 
     private final WebClient elasticWebClient;
