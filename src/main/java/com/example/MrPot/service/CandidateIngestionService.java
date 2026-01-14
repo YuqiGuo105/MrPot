@@ -3,6 +3,8 @@ package com.example.MrPot.service;
 import com.example.MrPot.service.KeyInfoExtractor.KeyInfo;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.beans.factory.ObjectProvider;
@@ -18,6 +20,8 @@ import java.util.UUID;
 @Service
 @RequiredArgsConstructor
 public class CandidateIngestionService {
+
+    private static final Logger log = LoggerFactory.getLogger(CandidateIngestionService.class);
 
     private final TempCandidateRepository tempRepo;
     private final ObjectProvider<ElasticCandidateIndexer> esIndexerProvider;
@@ -51,6 +55,7 @@ public class CandidateIngestionService {
                 "ts", Instant.now().toString()
         ));
 
+        log.debug("Ingesting candidate sessionId={} model={} dedupeKey={}", sessionId, model, dedupeKey);
         UUID candidateId = tempRepo.insertIgnoreConflict(new TempCandidateRepository.TempRow(
                 dedupeKey,
                 "NEW",
@@ -69,6 +74,11 @@ public class CandidateIngestionService {
                 evidenceJson,
                 metaJson
         ));
+        if (candidateId == null) {
+            log.info("Candidate insert skipped due to dedupe conflict: dedupeKey={}", dedupeKey);
+        } else {
+            log.info("Candidate stored in temp table: id={} dedupeKey={}", candidateId, dedupeKey);
+        }
 
         ElasticCandidateIndexer esIndexer = esIndexerProvider.getIfAvailable();
         if (storeToEs && esIndexer != null) {
