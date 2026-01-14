@@ -1,0 +1,55 @@
+<svg width="1200" height="720" viewBox="0 0 1200 720" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .bg { fill: #0f111a; }
+      .card { fill: #1a1e2e; stroke: #323852; stroke-width: 2; }
+      .title { fill: #e6e9f2; font-family: "Inter", "Segoe UI", sans-serif; font-size: 22px; font-weight: 600; }
+      .label { fill: #cdd3e2; font-family: "Inter", "Segoe UI", sans-serif; font-size: 16px; }
+      .sub { fill: #8f97b2; font-family: "Inter", "Segoe UI", sans-serif; font-size: 13px; }
+      .link { stroke: #4b516b; stroke-width: 2; stroke-dasharray: 6 6; }
+      .dot { fill: #2bd97b; }
+      .dot-ring { fill: #0f111a; stroke: #2bd97b; stroke-width: 2; }
+    </style>
+  </defs>
+  <rect class="bg" x="0" y="0" width="1200" height="720"/>
+
+  <rect class="card" x="110" y="80" width="440" height="200" rx="18"/>
+  <text class="title" x="150" y="130">MrPot API</text>
+  <text class="label" x="150" y="160">Spring Boot RAG service</text>
+  <circle class="dot-ring" cx="150" cy="200" r="8"/>
+  <circle class="dot" cx="150" cy="200" r="4"/>
+  <text class="sub" x="170" y="205">Online</text>
+
+  <rect class="card" x="660" y="60" width="430" height="180" rx="18"/>
+  <text class="title" x="700" y="110">Elasticsearch</text>
+  <text class="label" x="700" y="140">Search & retrieval index</text>
+  <circle class="dot-ring" cx="700" cy="175" r="8"/>
+  <circle class="dot" cx="700" cy="175" r="4"/>
+  <text class="sub" x="720" y="180">Online</text>
+
+  <rect class="card" x="660" y="260" width="430" height="180" rx="18"/>
+  <text class="title" x="700" y="310">Kibana</text>
+  <text class="label" x="700" y="340">Dashboards & search ops</text>
+  <circle class="dot-ring" cx="700" cy="375" r="8"/>
+  <circle class="dot" cx="700" cy="375" r="4"/>
+  <text class="sub" x="720" y="380">Online</text>
+
+  <rect class="card" x="110" y="360" width="440" height="200" rx="18"/>
+  <text class="title" x="150" y="410">PostgreSQL (pgvector)</text>
+  <text class="label" x="150" y="440">Primary data & embeddings</text>
+  <circle class="dot-ring" cx="150" cy="480" r="8"/>
+  <circle class="dot" cx="150" cy="480" r="4"/>
+  <text class="sub" x="170" y="485">Online</text>
+
+  <rect class="card" x="660" y="460" width="430" height="180" rx="18"/>
+  <text class="title" x="700" y="510">Redis</text>
+  <text class="label" x="700" y="540">Chat memory & caching</text>
+  <circle class="dot-ring" cx="700" cy="575" r="8"/>
+  <circle class="dot" cx="700" cy="575" r="4"/>
+  <text class="sub" x="720" y="580">Online</text>
+
+  <line class="link" x1="550" y1="170" x2="660" y2="150"/>
+  <line class="link" x1="550" y1="190" x2="660" y2="310"/>
+  <line class="link" x1="330" y1="280" x2="330" y2="360"/>
+  <line class="link" x1="550" y1="220" x2="660" y2="520"/>
+</svg>

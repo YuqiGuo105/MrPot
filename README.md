@@ -9,6 +9,31 @@ Mr Pot is a Spring Boot RAG service that streams "thinking" events while answeri
 - **Tools**: `KbTools`, `MemoryTools`, and `FileTools` encapsulate KB search, rendered chat history, and file understanding so they can be reused by Spring AI tool-calling or future MCP-style planners.
 - **Infra**: `RedisChatMemoryService`, `RagRunLogger`, and `LogIngestionClient` handle chat turn persistence and lightweight analytics logging.
 
+## Tools overview
+
+- **KbTools**: runs vector/sparse retrieval against the knowledge base, supporting multi-query expansion and configurable `topK`/`minScore`.
+- **MemoryTools**: renders recent chat turns from Redis into prompt-ready history strings with truncation.
+- **FileTools**: normalizes attachment URLs, extracts text, and generates follow-up search queries from file content.
+- **RoadmapPlannerTools**: creates an optional multi-step plan for deep-thinking requests.
+- **ScopeGuardTools**: enforces scope/privacy boundaries before deeper reasoning starts.
+- **EntityResolveTools**: resolves entities across question, files, and history to guide retrieval.
+- **EvidenceRerankTools**: re-ranks KB matches with extracted terms for relevance.
+- **ContextCompressTools**: compresses assembled context to fit prompt budgets while preserving key facts.
+- **ConflictDetectTools**: flags contradictions between retrieved context and attachments.
+- **PrivacySanitizerTools**: scrubs sensitive content from context before use.
+- **CodeSearchTools**: optionally searches a local repo when `mrpot.code.root` is configured.
+- **AnswerOutlineTools / AssumptionCheckTools / ActionPlanTools / TrackCorrectTools / EvidenceGapTools**: deep-thinking helpers that outline answers, check assumptions, identify gaps, keep responses on-track, and propose next steps.
+
+## Service structure
+
+- **MrPot API (Spring Boot)**: main RAG service handling requests, orchestration, and SSE streaming.
+- **PostgreSQL (pgvector)**: primary data store and embeddings for retrieval.
+- **Redis**: chat memory, caching, and session state.
+- **Elasticsearch**: search index for retrieval and analytics.
+- **Kibana**: dashboards for observability and search operations.
+
+![MrPot infrastructure diagram](docs/architecture.svg)
+
 ## Request workflow
 
 1. **Retrieval & memory**: KB matches are fetched via `KbTools.search`, and recent chat history is rendered through `MemoryTools.recent` with length caps for prompts.
