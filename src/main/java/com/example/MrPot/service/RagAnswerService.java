@@ -773,6 +773,8 @@ public class RagAnswerService {
 
                             Mono.fromRunnable(() -> {
                                         int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
+                                        log.debug("streamAnswerWithLogic logging candidate sessionId={} model={} latencyMs={}",
+                                                session.id(), model, latencyMs);
                                         safeLogOnce(
                                                 session.id(),
                                                 request.question(),
