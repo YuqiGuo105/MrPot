@@ -7,6 +7,8 @@ import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.scheduler.Schedulers;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Map;
 
@@ -14,6 +16,8 @@ import java.util.Map;
 @RequiredArgsConstructor
 @ConditionalOnBean(WebClient.class)
 public class ElasticCandidateIndexer {
+
+    private static final Logger log = LoggerFactory.getLogger(ElasticCandidateIndexer.class);
 
     private final WebClient elasticWebClient;
 
@@ -27,6 +31,7 @@ public class ElasticCandidateIndexer {
                 .bodyValue(doc)
                 .retrieve()
                 .bodyToMono(String.class)
+                .doOnSuccess(response -> log.info("Indexed candidate in Elasticsearch: index={} id={}", indexName, docId))
                 .doOnError(e -> {
                 })
                 .subscribeOn(Schedulers.boundedElastic())
