@@ -5,7 +5,9 @@ Mr Pot is a Spring Boot RAG service that streams “thinking” events while ans
 ## Demo
 Link: https://www.yuqi.site/?openChat=1
 
-https://github.com/user-attachments/assets/320f1a1c-d5c3-45b2-9c72-fdb160544cc2
+
+https://github.com/user-attachments/assets/4860a447-ff30-4a9d-a6a3-ede09c0b1f9e
+
 
 
 
