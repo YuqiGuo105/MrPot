@@ -78,4 +78,5 @@ Swagger UI is available at http://localhost:8080/swagger-ui when the app is runn
 - **ConflictDetectTools**: flags contradictions between retrieved context and attachments.
 - **PrivacySanitizerTools**: scrubs sensitive content from context before use.
 - **CodeSearchTools**: optionally searches a local repo when `mrpot.code.root` is configured.
+- **IntentDetectTools / KeywordExtractTools**: lightweight utility tools that infer user intent and extract keyword hints.
 - **AnswerOutlineTools / AssumptionCheckTools / ActionPlanTools / TrackCorrectTools / EvidenceGapTools**: deep-thinking helpers that outline answers, check assumptions, identify gaps, keep responses on-track, and propose next steps.
