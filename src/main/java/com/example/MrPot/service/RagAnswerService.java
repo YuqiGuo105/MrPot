@@ -1027,6 +1027,20 @@ public class RagAnswerService {
                 .defaultIfEmpty(List.of())
                 .cache();
 
+        Mono<IntentDetectTools.IntentResult> intentMono = Mono.fromCallable(() -> intentDetectTools.detect(request.question()))
+                .subscribeOn(Schedulers.boundedElastic())
+                .cache();
+
+        Mono<KeywordExtractTools.KeywordResult> keywordMono = Mono.zip(keyInfoMono, entityResolveMono)
+                .map(tuple -> {
+                    List<String> keyInfo = tuple.getT1();
+                    EntityResolveTools.EntityResolveResult entity = tuple.getT2();
+                    List<String> terms = (entity == null || entity.terms() == null) ? List.of() : entity.terms();
+                    return keywordExtractTools.extract(request.question(), keyInfo, terms, 10);
+                })
+                .subscribeOn(Schedulers.boundedElastic())
+                .cache();
+
         Mono<EvidenceGapTools.EvidenceGapResult> gapMono = Mono.zip(roadmapPlanMono, sanitizeMono, keyInfoMono)
                 .flatMap(tuple -> {
                     RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
