@@ -11,7 +11,9 @@ import com.example.MrPot.tools.EntityResolveTools;
 import com.example.MrPot.tools.EvidenceGapTools;
 import com.example.MrPot.tools.EvidenceRerankTools;
 import com.example.MrPot.tools.FileTools;
+import com.example.MrPot.tools.IntentDetectTools;
 import com.example.MrPot.tools.KbTools;
+import com.example.MrPot.tools.KeywordExtractTools;
 import com.example.MrPot.tools.MemoryTools;
 import com.example.MrPot.tools.PrivacySanitizerTools;
 import com.example.MrPot.tools.QuestionDecomposerTools;
@@ -59,6 +61,8 @@ public class RagAnswerService {
     private final AnswerOutlineTools answerOutlineTools;
     private final AssumptionCheckTools assumptionCheckTools;
     private final ActionPlanTools actionPlanTools;
+    private final IntentDetectTools intentDetectTools;
+    private final KeywordExtractTools keywordExtractTools;
     private final RedisChatMemoryService chatMemoryService;
     private final Map<String, ChatClient> chatClients;
 
@@ -165,7 +169,9 @@ public class RagAnswerService {
             EvidenceGapTools.EvidenceGapResult evidenceGap,
             AnswerOutlineTools.OutlineResult answerOutline,
             AssumptionCheckTools.AssumptionResult assumptionResult,
-            ActionPlanTools.ActionPlanResult actionPlan
+            ActionPlanTools.ActionPlanResult actionPlan,
+            IntentDetectTools.IntentResult intentResult,
+            KeywordExtractTools.KeywordResult keywordResult
     ) { }
 
     private record SanitizedEvidence(
@@ -231,8 +237,11 @@ public class RagAnswerService {
                         new EvidenceGapTools.EvidenceGapResult(List.of(), List.of(), "skipped"),
                         new AnswerOutlineTools.OutlineResult(List.of(), "bullets"),
                         new AssumptionCheckTools.AssumptionResult(List.of(), "low"),
-                        new ActionPlanTools.ActionPlanResult(List.of(), "bullets")
+                        new ActionPlanTools.ActionPlanResult(List.of(), "bullets"),
+                        new IntentDetectTools.IntentResult("general", List.of()),
+                        new KeywordExtractTools.KeywordResult(List.of(), "none")
                 ));
+        ToolRunSummary toolSummary = buildToolSummary(ctx, null);
 
         ChatClient chatClient = resolveClient(model);
 
@@ -256,7 +265,9 @@ public class RagAnswerService {
                 ctx.evidenceGap,
                 ctx.answerOutline,
                 ctx.assumptionResult,
-                ctx.actionPlan
+                ctx.actionPlan,
+                ctx.intentResult,
+                ctx.keywordResult
         );
 
         String answer;
@@ -272,7 +283,7 @@ public class RagAnswerService {
             error = ex.toString();
             int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
             safeLogOnce(session.id(), request.question(), model, topK, minScore,
-                    answer, latencyMs, noEvidence, error, ctx.retrieval);
+                    answer, latencyMs, noEvidence, error, ctx.retrieval, toolSummary);
             throw ex;
         }
 
@@ -283,7 +294,7 @@ public class RagAnswerService {
 
         int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
         safeLogOnce(session.id(), request.question(), model, topK, minScore,
-                answer, latencyMs, noEvidence, null, ctx.retrieval);
+                answer, latencyMs, noEvidence, null, ctx.retrieval, toolSummary);
 
         return new RagAnswer(answer, ctx.retrieval == null ? List.of() : ctx.retrieval.documents());
     }
@@ -304,6 +315,7 @@ public class RagAnswerService {
         return prepareContextMono(request, topK, minScore, deepThinking)
                 .flatMapMany(ctx -> {
                     ChatClient chatClient = resolveClient(model);
+                    ToolRunSummary toolSummary = buildToolSummary(ctx, null);
 
                     String rawHistory = memoryTools.recent(session.id(), MAX_HISTORY_TURNS);
                     String historyText = truncate(sanitizeHistoryForPrompt(rawHistory), MAX_HISTORY_CHARS);
@@ -325,7 +337,9 @@ public class RagAnswerService {
                             ctx.evidenceGap,
                             ctx.answerOutline,
                             ctx.assumptionResult,
-                            ctx.actionPlan
+                            ctx.actionPlan,
+                            ctx.intentResult,
+                            ctx.keywordResult
                     );
 
                     AtomicReference<StringBuilder> aggregate = new AtomicReference<>(new StringBuilder());
@@ -349,7 +363,7 @@ public class RagAnswerService {
                                 Mono.fromRunnable(() -> {
                                             int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
                                             safeLogOnce(session.id(), request.question(), model, topK, minScore,
-                                                    finalAnswer, latencyMs, noEvidence, errorRef.get(), ctx.retrieval);
+                                                    finalAnswer, latencyMs, noEvidence, errorRef.get(), ctx.retrieval, toolSummary);
                                         })
                                         .subscribeOn(Schedulers.boundedElastic())
                                         .subscribe();
@@ -377,6 +391,8 @@ public class RagAnswerService {
         AtomicReference<Boolean> noEvidenceRef = new AtomicReference<>(false);
         AtomicReference<RagRetrievalResult> retrievalRef = new AtomicReference<>(null);
         AtomicReference<String> errorRef = new AtomicReference<>(null);
+        AtomicReference<PreparedContext> ctxRef = new AtomicReference<>(null);
+        AtomicReference<TrackCorrectTools.TrackResult> trackCorrectRef = new AtomicReference<>(null);
 
         Mono<String> historyMono =
                 Mono.fromCallable(() -> memoryTools.recent(session.id(), MAX_HISTORY_TURNS))
@@ -461,6 +477,20 @@ public class RagAnswerService {
                 .defaultIfEmpty(List.of())
                 .cache();
 
+        Mono<IntentDetectTools.IntentResult> intentMono = Mono.fromCallable(() -> intentDetectTools.detect(request.question()))
+                .subscribeOn(Schedulers.boundedElastic())
+                .cache();
+
+        Mono<KeywordExtractTools.KeywordResult> keywordMono = Mono.zip(keyInfoMono, entityResolveMono)
+                .map(tuple -> {
+                    List<String> keyInfo = tuple.getT1();
+                    EntityResolveTools.EntityResolveResult entity = tuple.getT2();
+                    List<String> terms = (entity == null || entity.terms() == null) ? List.of() : entity.terms();
+                    return keywordExtractTools.extract(request.question(), keyInfo, terms, 10);
+                })
+                .subscribeOn(Schedulers.boundedElastic())
+                .cache();
+
         Mono<EvidenceGapTools.EvidenceGapResult> gapMono = Mono.zip(roadmapPlanMono, sanitizeMono, keyInfoMono)
                 .flatMap(tuple -> {
                     RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
@@ -520,11 +550,13 @@ public class RagAnswerService {
                 compressedMono,
                 sanitizeMono,
                 keyInfoMono,
+                intentMono,
+                keywordMono,
                 gapMono,
                 outlineMono,
                 assumptionMono,
                 actionPlanMono
-        ).cache();
+        ).doOnNext(ctxRef::set).cache();
 
         Mono<TrackCorrectTools.TrackResult> trackCorrectMono = Mono.zip(roadmapPlanMono, preparedContextMono)
                 .flatMap(tuple -> {
@@ -536,6 +568,7 @@ public class RagAnswerService {
                     return Mono.fromCallable(() -> trackCorrectTools.ensure(request.question(), roadmapSummary, status))
                             .subscribeOn(Schedulers.boundedElastic());
                 })
+                .doOnNext(trackCorrectRef::set)
                 .cache();
 
         Flux<ThinkingEvent> startStep = Flux.just(
@@ -718,6 +751,22 @@ public class RagAnswerService {
                 Flux.just(new ThinkingEvent("key_info", "Key info", Map.of("items", keyInfo)))
         ) : Flux.empty();
 
+        Flux<ThinkingEvent> intentStep = deepThinking ? intentMono.flatMapMany(result ->
+                Flux.just(new ThinkingEvent(
+                        "intent_detect",
+                        "Intent detection",
+                        Map.of("intent", result.intent(), "signals", result.signals())
+                ))
+        ) : Flux.empty();
+
+        Flux<ThinkingEvent> keywordStep = deepThinking ? keywordMono.flatMapMany(result ->
+                Flux.just(new ThinkingEvent(
+                        "keyword_extract",
+                        "Keyword extraction",
+                        Map.of("keywords", result.keywords(), "source", result.source())
+                ))
+        ) : Flux.empty();
+
         Flux<ThinkingEvent> evidenceGapStep = deepThinking ? gapMono.flatMapMany(result ->
                 Flux.just(new ThinkingEvent(
                         "evidence_gap",
@@ -802,7 +851,9 @@ public class RagAnswerService {
                                     ctx.evidenceGap,
                                     ctx.answerOutline,
                                     ctx.assumptionResult,
-                                    ctx.actionPlan
+                                    ctx.actionPlan,
+                                    ctx.intentResult,
+                                    ctx.keywordResult
                             );
 
                             return chatClient.prompt()
@@ -826,18 +877,19 @@ public class RagAnswerService {
 
                             Mono.fromRunnable(() -> {
                                         int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
-                                        safeLogOnce(
-                                                session.id(),
-                                                request.question(),
-                                                model,
-                                                topK,
-                                                minScore,
-                                                finalAnswer,
-                                                latencyMs,
-                                                Boolean.TRUE.equals(noEvidenceRef.get()),
-                                                errorRef.get(),
-                                                retrievalRef.get()
-                                        );
+                                            safeLogOnce(
+                                                    session.id(),
+                                                    request.question(),
+                                                    model,
+                                                    topK,
+                                                    minScore,
+                                                    finalAnswer,
+                                                    latencyMs,
+                                                    Boolean.TRUE.equals(noEvidenceRef.get()),
+                                                    errorRef.get(),
+                                                    retrievalRef.get(),
+                                                    buildToolSummary(ctxRef.get(), trackCorrectRef.get())
+                                            );
                                     })
                                     .subscribeOn(Schedulers.boundedElastic())
                                     .subscribe();
@@ -886,6 +938,8 @@ public class RagAnswerService {
                 kbDocsStep,
                 contextCompressStep,
                 keyInfoStep,
+                intentStep,
+                keywordStep,
                 evidenceGapStep,
                 answerOutlineStep,
                 assumptionCheckStep,
@@ -1032,6 +1086,8 @@ public class RagAnswerService {
                 compressedMono,
                 sanitizeMono,
                 keyInfoMono,
+                intentMono,
+                keywordMono,
                 gapMono,
                 outlineMono,
                 assumptionMono,
@@ -1219,6 +1275,8 @@ public class RagAnswerService {
                                                           Mono<String> compressedMono,
                                                           Mono<SanitizedEvidence> sanitizedMono,
                                                           Mono<List<String>> keyInfoMono,
+                                                          Mono<IntentDetectTools.IntentResult> intentMono,
+                                                          Mono<KeywordExtractTools.KeywordResult> keywordMono,
                                                           Mono<EvidenceGapTools.EvidenceGapResult> gapMono,
                                                           Mono<AnswerOutlineTools.OutlineResult> outlineMono,
                                                           Mono<AssumptionCheckTools.AssumptionResult> assumptionMono,
@@ -1232,6 +1290,8 @@ public class RagAnswerService {
                         compressedMono,
                         sanitizedMono,
                         keyInfoMono,
+                        intentMono,
+                        keywordMono,
                         gapMono,
                         outlineMono,
                         assumptionMono,
@@ -1246,10 +1306,12 @@ public class RagAnswerService {
                     SanitizedEvidence sanitized = (SanitizedEvidence) tuple[5];
                     @SuppressWarnings("unchecked")
                     List<String> keyInfo = (List<String>) tuple[6];
-                    EvidenceGapTools.EvidenceGapResult gapResult = (EvidenceGapTools.EvidenceGapResult) tuple[7];
-                    AnswerOutlineTools.OutlineResult outlineResult = (AnswerOutlineTools.OutlineResult) tuple[8];
-                    AssumptionCheckTools.AssumptionResult assumptionResult = (AssumptionCheckTools.AssumptionResult) tuple[9];
-                    ActionPlanTools.ActionPlanResult actionPlanResult = (ActionPlanTools.ActionPlanResult) tuple[10];
+                    IntentDetectTools.IntentResult intentResult = (IntentDetectTools.IntentResult) tuple[7];
+                    KeywordExtractTools.KeywordResult keywordResult = (KeywordExtractTools.KeywordResult) tuple[8];
+                    EvidenceGapTools.EvidenceGapResult gapResult = (EvidenceGapTools.EvidenceGapResult) tuple[9];
+                    AnswerOutlineTools.OutlineResult outlineResult = (AnswerOutlineTools.OutlineResult) tuple[10];
+                    AssumptionCheckTools.AssumptionResult assumptionResult = (AssumptionCheckTools.AssumptionResult) tuple[11];
+                    ActionPlanTools.ActionPlanResult actionPlanResult = (ActionPlanTools.ActionPlanResult) tuple[12];
 
                     boolean outOfScopeKb = isOutOfScope(retrieval);
                     boolean hasAnyRef = hasAnyReference(retrieval, fileText);
@@ -1292,7 +1354,9 @@ public class RagAnswerService {
                             gapResult == null ? new EvidenceGapTools.EvidenceGapResult(List.of(), List.of(), "skipped") : gapResult,
                             outlineResult == null ? new AnswerOutlineTools.OutlineResult(List.of(), "bullets") : outlineResult,
                             assumptionResult == null ? new AssumptionCheckTools.AssumptionResult(List.of(), "low") : assumptionResult,
-                            actionPlanResult == null ? new ActionPlanTools.ActionPlanResult(List.of(), "bullets") : actionPlanResult
+                            actionPlanResult == null ? new ActionPlanTools.ActionPlanResult(List.of(), "bullets") : actionPlanResult,
+                            intentResult == null ? new IntentDetectTools.IntentResult("general", List.of()) : intentResult,
+                            keywordResult == null ? new KeywordExtractTools.KeywordResult(List.of(), "none") : keywordResult
                     );
                 }
         );
@@ -1582,7 +1646,9 @@ public class RagAnswerService {
                 new EvidenceGapTools.EvidenceGapResult(List.of(), List.of(), "skipped"),
                 new AnswerOutlineTools.OutlineResult(List.of(), "bullets"),
                 new AssumptionCheckTools.AssumptionResult(List.of(), "low"),
-                new ActionPlanTools.ActionPlanResult(List.of(), "bullets")
+                new ActionPlanTools.ActionPlanResult(List.of(), "bullets"),
+                new IntentDetectTools.IntentResult("general", List.of()),
+                new KeywordExtractTools.KeywordResult(List.of(), "none")
         );
     }
 
@@ -1601,7 +1667,9 @@ public class RagAnswerService {
                                EvidenceGapTools.EvidenceGapResult evidenceGap,
                                AnswerOutlineTools.OutlineResult answerOutline,
                                AssumptionCheckTools.AssumptionResult assumptionResult,
-                               ActionPlanTools.ActionPlanResult actionPlan) {
+                               ActionPlanTools.ActionPlanResult actionPlan,
+                               IntentDetectTools.IntentResult intentResult,
+                               KeywordExtractTools.KeywordResult keywordResult) {
 
         String rawContext = (retrieval == null) ? "" : Optional.ofNullable(retrieval.context()).orElse("");
         String contextText = compactLogContext(rawContext, MAX_CONTEXT_CHARS);
@@ -1654,6 +1722,18 @@ public class RagAnswerService {
                 sb.append("- ").append(item.trim()).append("\n");
             }
             sb.append("\n");
+        }
+
+        if (deepThinking && intentResult != null && intentResult.intent() != null && !intentResult.intent().isBlank()) {
+            sb.append("Intent: ").append(intentResult.intent());
+            if (intentResult.signals() != null && !intentResult.signals().isEmpty()) {
+                sb.append(" (signals: ").append(String.join(", ", intentResult.signals())).append(")");
+            }
+            sb.append("\n\n");
+        }
+
+        if (deepThinking && keywordResult != null && keywordResult.keywords() != null && !keywordResult.keywords().isEmpty()) {
+            sb.append("Keyword hints: ").append(String.join(", ", keywordResult.keywords())).append("\n\n");
         }
 
         if (deepThinking && evidenceGap != null) {
@@ -2016,7 +2096,8 @@ public class RagAnswerService {
             Integer latencyMs,
             boolean outOfScope,
             String error,
-            RagRetrievalResult retrieval
+            RagRetrievalResult retrieval,
+            ToolRunSummary toolSummary
     ) {
         try {
             candidateIngestionService.ingest(
@@ -2029,10 +2110,27 @@ public class RagAnswerService {
                     error,
                     question,
                     answerText,
-                    retrieval == null ? List.of() : retrieval.documents()
+                    retrieval == null ? List.of() : retrieval.documents(),
+                    toolSummary
             );
         } catch (Exception ignored) {
             // Logging must never break answering
         }
+    }
+
+    private ToolRunSummary buildToolSummary(PreparedContext ctx, TrackCorrectTools.TrackResult trackCorrectResult) {
+        if (ctx == null) return null;
+        return new ToolRunSummary(
+                ctx.keyInfo,
+                ctx.evidenceGap,
+                ctx.answerOutline,
+                ctx.assumptionResult,
+                ctx.actionPlan,
+                ctx.scopeGuardResult,
+                ctx.entityTerms,
+                ctx.intentResult,
+                ctx.keywordResult,
+                trackCorrectResult
+        );
     }
 }
