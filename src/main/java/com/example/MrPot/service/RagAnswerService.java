@@ -20,6 +20,7 @@ import com.example.MrPot.tools.QuestionDecomposerTools;
 import com.example.MrPot.tools.RoadmapPlannerTools;
 import com.example.MrPot.tools.ScopeGuardTools;
 import com.example.MrPot.tools.TrackCorrectTools;
+import com.example.MrPot.tools.YuqiPrivacyStrictTools;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -63,6 +64,7 @@ public class RagAnswerService {
     private final ActionPlanTools actionPlanTools;
     private final IntentDetectTools intentDetectTools;
     private final KeywordExtractTools keywordExtractTools;
+    private final YuqiPrivacyStrictTools yuqiPrivacyStrictTools;
     private final RedisChatMemoryService chatMemoryService;
     private final Map<String, ChatClient> chatClients;
 
@@ -171,7 +173,8 @@ public class RagAnswerService {
             AssumptionCheckTools.AssumptionResult assumptionResult,
             ActionPlanTools.ActionPlanResult actionPlan,
             IntentDetectTools.IntentResult intentResult,
-            KeywordExtractTools.KeywordResult keywordResult
+            KeywordExtractTools.KeywordResult keywordResult,
+            YuqiPrivacyStrictTools.PrivacyStrictResult privacyStrictResult
     ) { }
 
     private record SanitizedEvidence(
@@ -239,7 +242,8 @@ public class RagAnswerService {
                         new AssumptionCheckTools.AssumptionResult(List.of(), "low"),
                         new ActionPlanTools.ActionPlanResult(List.of(), "bullets"),
                         new IntentDetectTools.IntentResult("general", List.of()),
-                        new KeywordExtractTools.KeywordResult(List.of(), "none")
+                        new KeywordExtractTools.KeywordResult(List.of(), "none"),
+                        YuqiPrivacyStrictTools.PrivacyStrictResult.allowDefault()
                 ));
         ToolRunSummary toolSummary = buildToolSummary(ctx, null);
 
@@ -267,7 +271,8 @@ public class RagAnswerService {
                 ctx.assumptionResult,
                 ctx.actionPlan,
                 ctx.intentResult,
-                ctx.keywordResult
+                ctx.keywordResult,
+                ctx.privacyStrictResult
         );
 
         String answer;
@@ -433,6 +438,14 @@ public class RagAnswerService {
                 .cache()
                 : Mono.just(ScopeGuardTools.ScopeGuardResult.scopedDefault());
 
+        Mono<YuqiPrivacyStrictTools.PrivacyStrictResult> privacyStrictMono = roadmapPlanMono.flatMap(plan -> {
+            if (!deepThinking || !plan.useYuqiPrivacyStrict()) {
+                return Mono.just(YuqiPrivacyStrictTools.PrivacyStrictResult.allowDefault());
+            }
+            return Mono.fromCallable(() -> yuqiPrivacyStrictTools.check(request.question()))
+                    .subscribeOn(Schedulers.boundedElastic());
+        }).cache();
+
         Mono<EntityResolveTools.EntityResolveResult> entityResolveMono = Mono.zip(roadmapPlanMono, fileTextMono)
                 .flatMap(tuple -> {
                     RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
@@ -555,7 +568,8 @@ public class RagAnswerService {
                 gapMono,
                 outlineMono,
                 assumptionMono,
-                actionPlanMono
+                actionPlanMono,
+                privacyStrictMono
         ).doOnNext(ctxRef::set).cache();
 
         Mono<TrackCorrectTools.TrackResult> trackCorrectMono = Mono.zip(roadmapPlanMono, preparedContextMono)
@@ -649,6 +663,18 @@ public class RagAnswerService {
                                 "scoped", result.scoped(),
                                 "reason", result.reason(),
                                 "rewriteHint", result.rewriteHint()
+                        )
+                ))
+        ) : Flux.empty();
+
+        Flux<ThinkingEvent> privacyStrictStep = deepThinking ? privacyStrictMono.flatMapMany(result ->
+                Flux.just(new ThinkingEvent(
+                        "yuqi_privacy_strict",
+                        "Yuqi privacy strict",
+                        Map.of(
+                                "outOfScope", result.outOfScope(),
+                                "reason", result.reason(),
+                                "signals", result.signals()
                         )
                 ))
         ) : Flux.empty();
@@ -853,7 +879,8 @@ public class RagAnswerService {
                                     ctx.assumptionResult,
                                     ctx.actionPlan,
                                     ctx.intentResult,
-                                    ctx.keywordResult
+                                    ctx.keywordResult,
+                                    ctx.privacyStrictResult
                             );
 
                             return chatClient.prompt()
@@ -928,6 +955,7 @@ public class RagAnswerService {
                 fileFetchStep,
                 fileExtractStep,
                 scopeGuardStep,
+                privacyStrictStep,
                 trackCorrectStep,
                 entityResolveStep,
                 codeSearchStep,
@@ -983,6 +1011,14 @@ public class RagAnswerService {
                 .subscribeOn(Schedulers.boundedElastic())
                 .cache()
                 : Mono.just(ScopeGuardTools.ScopeGuardResult.scopedDefault());
+
+        Mono<YuqiPrivacyStrictTools.PrivacyStrictResult> privacyStrictMono = roadmapPlanMono.flatMap(plan -> {
+            if (!deepThinking || !plan.useYuqiPrivacyStrict()) {
+                return Mono.just(YuqiPrivacyStrictTools.PrivacyStrictResult.allowDefault());
+            }
+            return Mono.fromCallable(() -> yuqiPrivacyStrictTools.check(request.question()))
+                    .subscribeOn(Schedulers.boundedElastic());
+        }).cache();
 
         Mono<EntityResolveTools.EntityResolveResult> entityResolveMono = Mono.zip(roadmapPlanMono, fileTextMono)
                 .flatMap(tuple -> {
@@ -1105,7 +1141,8 @@ public class RagAnswerService {
                 gapMono,
                 outlineMono,
                 assumptionMono,
-                actionPlanMono
+                actionPlanMono,
+                privacyStrictMono
         );
     }
 
@@ -1294,7 +1331,8 @@ public class RagAnswerService {
                                                           Mono<EvidenceGapTools.EvidenceGapResult> gapMono,
                                                           Mono<AnswerOutlineTools.OutlineResult> outlineMono,
                                                           Mono<AssumptionCheckTools.AssumptionResult> assumptionMono,
-                                                          Mono<ActionPlanTools.ActionPlanResult> actionPlanMono) {
+                                                          Mono<ActionPlanTools.ActionPlanResult> actionPlanMono,
+                                                          Mono<YuqiPrivacyStrictTools.PrivacyStrictResult> privacyStrictMono) {
         return Mono.zip(
                 List.of(
                         retrievalMono,
@@ -1309,7 +1347,8 @@ public class RagAnswerService {
                         gapMono,
                         outlineMono,
                         assumptionMono,
-                        actionPlanMono
+                        actionPlanMono,
+                        privacyStrictMono
                 ),
                 tuple -> {
                     RagRetrievalResult retrieval = (RagRetrievalResult) tuple[0];
@@ -1326,6 +1365,8 @@ public class RagAnswerService {
                     AnswerOutlineTools.OutlineResult outlineResult = (AnswerOutlineTools.OutlineResult) tuple[10];
                     AssumptionCheckTools.AssumptionResult assumptionResult = (AssumptionCheckTools.AssumptionResult) tuple[11];
                     ActionPlanTools.ActionPlanResult actionPlanResult = (ActionPlanTools.ActionPlanResult) tuple[12];
+                    YuqiPrivacyStrictTools.PrivacyStrictResult privacyStrictResult =
+                            (YuqiPrivacyStrictTools.PrivacyStrictResult) tuple[13];
 
                     boolean outOfScopeKb = isOutOfScope(retrieval);
                     boolean hasAnyRef = hasAnyReference(retrieval, fileText);
@@ -1335,12 +1376,22 @@ public class RagAnswerService {
                             outOfScopeKb = true;
                             hasAnyRef = false;
                         }
+                        if (privacyStrictResult != null && privacyStrictResult.outOfScope()) {
+                            outOfScopeKb = true;
+                            hasAnyRef = false;
+                        }
                         if (!compressed.isBlank()) {
                             hasAnyRef = true;
                         }
                     }
 
                     if (scopeMode == RagAnswerRequest.ScopeMode.YUQI_ONLY && (guard == null || !guard.scoped())) {
+                        outOfScopeKb = true;
+                        hasAnyRef = false;
+                    }
+                    if (scopeMode == RagAnswerRequest.ScopeMode.YUQI_ONLY
+                            && privacyStrictResult != null
+                            && privacyStrictResult.outOfScope()) {
                         outOfScopeKb = true;
                         hasAnyRef = false;
                     }
@@ -1370,7 +1421,10 @@ public class RagAnswerService {
                             assumptionResult == null ? new AssumptionCheckTools.AssumptionResult(List.of(), "low") : assumptionResult,
                             actionPlanResult == null ? new ActionPlanTools.ActionPlanResult(List.of(), "bullets") : actionPlanResult,
                             intentResult == null ? new IntentDetectTools.IntentResult("general", List.of()) : intentResult,
-                            keywordResult == null ? new KeywordExtractTools.KeywordResult(List.of(), "none") : keywordResult
+                            keywordResult == null ? new KeywordExtractTools.KeywordResult(List.of(), "none") : keywordResult,
+                            privacyStrictResult == null
+                                    ? YuqiPrivacyStrictTools.PrivacyStrictResult.allowDefault()
+                                    : privacyStrictResult
                     );
                 }
         );
@@ -1427,6 +1481,7 @@ public class RagAnswerService {
                 List.of(),
                 true,
                 hasFiles,
+                false,
                 false,
                 false,
                 false,
@@ -1662,7 +1717,8 @@ public class RagAnswerService {
                 new AssumptionCheckTools.AssumptionResult(List.of(), "low"),
                 new ActionPlanTools.ActionPlanResult(List.of(), "bullets"),
                 new IntentDetectTools.IntentResult("general", List.of()),
-                new KeywordExtractTools.KeywordResult(List.of(), "none")
+                new KeywordExtractTools.KeywordResult(List.of(), "none"),
+                YuqiPrivacyStrictTools.PrivacyStrictResult.allowDefault()
         );
     }
 
@@ -1683,7 +1739,8 @@ public class RagAnswerService {
                                AssumptionCheckTools.AssumptionResult assumptionResult,
                                ActionPlanTools.ActionPlanResult actionPlan,
                                IntentDetectTools.IntentResult intentResult,
-                               KeywordExtractTools.KeywordResult keywordResult) {
+                               KeywordExtractTools.KeywordResult keywordResult,
+                               YuqiPrivacyStrictTools.PrivacyStrictResult privacyStrictResult) {
 
         String rawContext = (retrieval == null) ? "" : Optional.ofNullable(retrieval.context()).orElse("");
         String contextText = compactLogContext(rawContext, MAX_CONTEXT_CHARS);
@@ -1716,6 +1773,9 @@ public class RagAnswerService {
             } else {
                 sb.append("Instruction: refuse to provide private contact details; suggest safe public info topics.\n\n");
             }
+        }
+        if (privacyStrictResult != null && privacyStrictResult.outOfScope()) {
+            sb.append("Instruction: Yuqi privacy strict -> treat as out of scope and avoid private details.\n\n");
         }
 
         String fileSection = truncate(Optional.ofNullable(fileText).orElse(""), MAX_FILE_CONTEXT_CHARS);
@@ -2144,6 +2204,7 @@ public class RagAnswerService {
                 ctx.entityTerms,
                 ctx.intentResult,
                 ctx.keywordResult,
+                ctx.privacyStrictResult,
                 trackCorrectResult
         );
     }

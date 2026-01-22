@@ -14,5 +14,6 @@ public record ToolRunSummary(
         List<String> entityTerms,
         IntentDetectTools.IntentResult intentResult,
         KeywordExtractTools.KeywordResult keywordResult,
+        YuqiPrivacyStrictTools.PrivacyStrictResult privacyStrictResult,
         TrackCorrectTools.TrackResult trackCorrectResult
 ) {}

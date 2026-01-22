@@ -159,6 +159,13 @@ public class CandidateIngestionService {
             }
             out.put("scope_guard", scopeGuard);
         }
+        if (summary.privacyStrictResult() != null) {
+            Map<String, Object> privacyStrict = new LinkedHashMap<>();
+            privacyStrict.put("out_of_scope", summary.privacyStrictResult().outOfScope());
+            privacyStrict.put("reason", summary.privacyStrictResult().reason());
+            privacyStrict.put("signals", summary.privacyStrictResult().signals());
+            out.put("yuqi_privacy_strict", privacyStrict);
+        }
         if (summary.intentResult() != null) {
             Map<String, Object> intent = new LinkedHashMap<>();
             intent.put("intent", summary.intentResult().intent());
