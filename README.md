@@ -2,6 +2,15 @@
 
 Mr Pot is a Spring Boot RAG service that streams “thinking” events while answering questions with retrieval, memory, and file-understanding context.
 
+## Demo
+Link: https://www.yuqi.site/?openChat=1
+
+
+https://github.com/user-attachments/assets/4860a447-ff30-4a9d-a6a3-ede09c0b1f9e
+
+
+
+
 ## Service structure
 ![Deployment UML](./UML.png)
 This project is commonly deployed as a small set of services (e.g., on Railway or with Docker Compose):
@@ -69,4 +78,5 @@ Swagger UI is available at http://localhost:8080/swagger-ui when the app is runn
 - **ConflictDetectTools**: flags contradictions between retrieved context and attachments.
 - **PrivacySanitizerTools**: scrubs sensitive content from context before use.
 - **CodeSearchTools**: optionally searches a local repo when `mrpot.code.root` is configured.
+- **IntentDetectTools / KeywordExtractTools**: lightweight utility tools that infer user intent and extract keyword hints.
 - **AnswerOutlineTools / AssumptionCheckTools / ActionPlanTools / TrackCorrectTools / EvidenceGapTools**: deep-thinking helpers that outline answers, check assumptions, identify gaps, keep responses on-track, and propose next steps.
