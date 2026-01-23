@@ -235,7 +235,9 @@ public class RagAnswerService {
             throw ex;
         }
 
-        chatMemoryService.appendTurn(session.id(), request.question(), answer, session.temporary());
+        if (shouldAppendHistory(ctx.scopeGuardResult)) {
+            chatMemoryService.appendTurn(session.id(), request.question(), answer, session.temporary());
+        }
 
         int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
         safeLogOnce(session.id(), request.question(), model, topK, minScore,
@@ -295,7 +297,9 @@ public class RagAnswerService {
                             .doOnError(ex -> errorRef.set(ex.toString()))
                             .doFinally(signalType -> {
                                 String finalAnswer = aggregate.get().toString();
-                                chatMemoryService.appendTurn(session.id(), request.question(), finalAnswer, session.temporary());
+                                if (shouldAppendHistory(ctx.scopeGuardResult)) {
+                                    chatMemoryService.appendTurn(session.id(), request.question(), finalAnswer, session.temporary());
+                                }
 
                                 Mono.fromRunnable(() -> {
                                             int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
@@ -327,6 +331,7 @@ public class RagAnswerService {
         AtomicReference<StringBuilder> aggregate = new AtomicReference<>(new StringBuilder());
         AtomicReference<Boolean> noEvidenceRef = new AtomicReference<>(false);
         AtomicReference<RagRetrievalResult> retrievalRef = new AtomicReference<>(null);
+        AtomicReference<Boolean> outOfScopeRef = new AtomicReference<>(false);
         AtomicReference<String> errorRef = new AtomicReference<>(null);
 
         Mono<String> historyMono =
@@ -735,6 +740,7 @@ public class RagAnswerService {
 
                             boolean noEvidence = !ctx.hasAnyRef;
                             noEvidenceRef.set(noEvidence);
+                            outOfScopeRef.set(!shouldAppendHistory(ctx.scopeGuardResult));
 
                             String historyText = truncate(history, MAX_HISTORY_CHARS);
                             String prompt = buildPrompt(
@@ -769,7 +775,9 @@ public class RagAnswerService {
                         .doOnError(ex -> errorRef.set(ex.toString()))
                         .doFinally(signalType -> {
                             String finalAnswer = aggregate.get().toString();
-                            chatMemoryService.appendTurn(session.id(), request.question(), finalAnswer, session.temporary());
+                            if (!Boolean.TRUE.equals(outOfScopeRef.get())) {
+                                chatMemoryService.appendTurn(session.id(), request.question(), finalAnswer, session.temporary());
+                            }
 
                             Mono.fromRunnable(() -> {
                                         int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
@@ -1942,6 +1950,10 @@ public class RagAnswerService {
         if (s == null) return "";
         if (s.length() <= maxChars) return s;
         return s.substring(0, maxChars) + "...";
+    }
+
+    private boolean shouldAppendHistory(ScopeGuardTools.ScopeGuardResult scopeGuardResult) {
+        return scopeGuardResult == null || scopeGuardResult.scoped();
     }
 
     private static double round3(double v) {
