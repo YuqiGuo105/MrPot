@@ -46,7 +46,8 @@ public class CandidateIngestionService {
             String error,
             String question,
             String answer,
-            Object retrievalDocs
+            Object retrievalDocs,
+            ToolRunSummary toolSummary
     ) {
         String dedupeKey = sha256Base64(safe(sessionId) + "|" + safe(question) + "|" + safe(model) + "|" + safe(error));
 
@@ -55,6 +56,9 @@ public class CandidateIngestionService {
         // Map.of 遇到 null 会 NPE，这里用 LinkedHashMap 更稳
         Map<String, Object> evidenceMap = new LinkedHashMap<>();
         evidenceMap.put("retrieval_docs", retrievalDocs);
+        if (toolSummary != null) {
+            evidenceMap.put("tool_results", buildToolResults(toolSummary));
+        }
 
         String keyStepsJson = toJson(keyInfo.steps());
         String keyPointsJson = toJson(keyInfo.points());
@@ -118,6 +122,10 @@ public class CandidateIngestionService {
             doc.put("key_steps", keyInfo.steps());
             doc.put("key_points", keyInfo.points());
 
+            if (toolSummary != null) {
+                doc.put("tool_results", buildToolResults(toolSummary));
+            }
+
             log.info("ES upsert start: id={}", dedupeKey);
             esIndexer.upsert(dedupeKey, doc);
         } else {
@@ -128,6 +136,82 @@ public class CandidateIngestionService {
     private String toJson(Object value) {
         try { return objectMapper.writeValueAsString(value); }
         catch (Exception e) { return "{}"; }
+    }
+
+    private Map<String, Object> buildToolResults(ToolRunSummary summary) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        if (summary == null) return out;
+
+        if (summary.keyInfo() != null && !summary.keyInfo().isEmpty()) {
+            out.put("key_info", summary.keyInfo());
+        }
+        if (summary.entityTerms() != null && !summary.entityTerms().isEmpty()) {
+            out.put("entity_terms", summary.entityTerms());
+        }
+        if (summary.scopeGuard() != null) {
+            Map<String, Object> scopeGuard = new LinkedHashMap<>();
+            scopeGuard.put("scoped", summary.scopeGuard().scoped());
+            if (summary.scopeGuard().reason() != null) {
+                scopeGuard.put("reason", summary.scopeGuard().reason());
+            }
+            if (summary.scopeGuard().rewriteHint() != null) {
+                scopeGuard.put("rewriteHint", summary.scopeGuard().rewriteHint());
+            }
+            out.put("scope_guard", scopeGuard);
+        }
+        if (summary.privacyStrictResult() != null) {
+            Map<String, Object> privacyStrict = new LinkedHashMap<>();
+            privacyStrict.put("out_of_scope", summary.privacyStrictResult().outOfScope());
+            privacyStrict.put("reason", summary.privacyStrictResult().reason());
+            privacyStrict.put("signals", summary.privacyStrictResult().signals());
+            out.put("yuqi_privacy_strict", privacyStrict);
+        }
+        if (summary.intentResult() != null) {
+            Map<String, Object> intent = new LinkedHashMap<>();
+            intent.put("intent", summary.intentResult().intent());
+            intent.put("signals", summary.intentResult().signals());
+            out.put("intent", intent);
+        }
+        if (summary.keywordResult() != null) {
+            Map<String, Object> keywords = new LinkedHashMap<>();
+            keywords.put("items", summary.keywordResult().keywords());
+            keywords.put("source", summary.keywordResult().source());
+            out.put("keywords", keywords);
+        }
+        if (summary.evidenceGap() != null) {
+            Map<String, Object> evidenceGap = new LinkedHashMap<>();
+            evidenceGap.put("status", summary.evidenceGap().status());
+            evidenceGap.put("missing_facts", summary.evidenceGap().missingFacts());
+            evidenceGap.put("follow_ups", summary.evidenceGap().followUps());
+            out.put("evidence_gap", evidenceGap);
+        }
+        if (summary.answerOutline() != null) {
+            Map<String, Object> answerOutline = new LinkedHashMap<>();
+            answerOutline.put("style", summary.answerOutline().style());
+            answerOutline.put("sections", summary.answerOutline().sections());
+            out.put("answer_outline", answerOutline);
+        }
+        if (summary.assumptionResult() != null) {
+            Map<String, Object> assumptionCheck = new LinkedHashMap<>();
+            assumptionCheck.put("risk", summary.assumptionResult().riskLevel());
+            assumptionCheck.put("assumptions", summary.assumptionResult().assumptions());
+            out.put("assumption_check", assumptionCheck);
+        }
+        if (summary.actionPlan() != null) {
+            Map<String, Object> actionPlan = new LinkedHashMap<>();
+            actionPlan.put("style", summary.actionPlan().style());
+            actionPlan.put("steps", summary.actionPlan().steps());
+            out.put("action_plan", actionPlan);
+        }
+        if (summary.trackCorrectResult() != null) {
+            Map<String, Object> trackCorrect = new LinkedHashMap<>();
+            trackCorrect.put("on_track", summary.trackCorrectResult().onTrack());
+            trackCorrect.put("status", summary.trackCorrectResult().status());
+            trackCorrect.put("hint", summary.trackCorrectResult().hint());
+            out.put("track_correct", trackCorrect);
+        }
+
+        return out;
     }
 
     private static String safe(String value) { return value == null ? "" : value; }

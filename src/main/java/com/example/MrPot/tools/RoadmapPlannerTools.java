@@ -31,7 +31,8 @@ public class RoadmapPlannerTools {
             boolean useEvidenceGap,
             boolean useAnswerOutline,
             boolean useAssumptionCheck,
-            boolean useActionPlan
+            boolean useActionPlan,
+            boolean useYuqiPrivacyStrict
     ) {}
 
     @Tool(name = "roadmap_plan", description = "Plan which tools to use and which to skip for deep thinking.")
@@ -57,8 +58,10 @@ public class RoadmapPlannerTools {
         boolean useAnswerOutline = deepThinking;
         boolean useAssumptionCheck = deepThinking;
         boolean useActionPlan = deepThinking;
+        boolean useYuqiPrivacyStrict = deepThinking;
 
         steps.add("scope_guard");
+        if (useYuqiPrivacyStrict) steps.add("yuqi_privacy_strict");
         if (useQuestionDecompose) steps.add("question_decompose");
         if (useKb) steps.add("kb_search");
         if (useFiles) steps.add("file_fetch");
@@ -117,6 +120,10 @@ public class RoadmapPlannerTools {
             skips.add("action_plan");
             rationale.add("action plan only for deep thinking mode");
         }
+        if (!useYuqiPrivacyStrict) {
+            skips.add("yuqi_privacy_strict");
+            rationale.add("Yuqi privacy strict only for deep thinking mode");
+        }
 
         if (scopeMode == RagAnswerRequest.ScopeMode.YUQI_ONLY && !mentionsYuqi) {
             rationale.add("YUQI_ONLY mode -> out of scope unless explicitly about Yuqi");
@@ -137,7 +144,8 @@ public class RoadmapPlannerTools {
                 useEvidenceGap,
                 useAnswerOutline,
                 useAssumptionCheck,
-                useActionPlan
+                useActionPlan,
+                useYuqiPrivacyStrict
         );
     }
 
