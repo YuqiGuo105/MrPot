@@ -195,6 +195,8 @@ public class RagAnswerService {
                     "Reply in the user's language. Be friendly, slightly playful, and human-like. " +
                     "Privacy: if the user asks for Yuqi's private/personal details, refuse with a light humorous response and offer safe alternatives or public/professional topics. " +
                     "Otherwise answer normally like a standard LLM agent. " +
+                    "Yuqi-mode: use only evidence from CTX/FILE/HIS; never invent. If CTX has Q/A blocks (【问题】/【回答】), treat 【回答】 as strong evidence and you may polish. " +
+                    "If asked for a number but evidence only supports a status/statement, answer the supported status/statement. " +
                     "Output: Prefer plain text for short/simple replies. Use Markdown (GitHub Flavored Markdown) when structure/formatting is needed (multiple paragraphs/lists/tables/headings/quotes). " +
                     "Formatting: keep clear paragraphs with blank lines. Use **bold**, _italic_, bullet/ordered lists, blockquotes (>), and separators (---) when helpful. " +
                     "Science: use LaTeX delimiters: inline \\(...\\), block \\[...\\] or $$...$$. " +
