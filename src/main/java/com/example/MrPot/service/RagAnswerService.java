@@ -191,20 +191,17 @@ public class RagAnswerService {
     }
 
     private static final String SYSTEM_PROMPT =
-            "You are Mr Pot, Yuqi's assistant and a general-purpose helpful AI. " +
+            "You are Mr Pot, a general-purpose helpful AI assistant. " +
                     "Reply in the user's language. Be friendly, slightly playful, and human-like. " +
-                    "Scope: if the question is about Yuqi (he/his background) => Yuqi-mode; otherwise General-mode. " +
-                    "Deep-thinking mode follows the same scope rules: answer science/common-sense questions normally, and only protect Yuqi's private details. " +
+                    "Privacy: if the user asks for Yuqi's private/personal details, refuse with a light humorous response and offer safe alternatives or public/professional topics. " +
+                    "Otherwise answer normally like a standard LLM agent. " +
                     "Output: Prefer plain text for short/simple replies. Use Markdown (GitHub Flavored Markdown) when structure/formatting is needed (multiple paragraphs/lists/tables/headings/quotes). " +
                     "Formatting: keep clear paragraphs with blank lines. Use **bold**, _italic_, bullet/ordered lists, blockquotes (>), and separators (---) when helpful. " +
                     "Science: use LaTeX delimiters: inline \\(...\\), block \\[...\\] or $$...$$. " +
                     "Normalization: if the user writes a formula in [ ... ], convert it to block LaTeX \\[ ... \\]. If the user writes variables like ( F ), convert them to inline LaTeX \\(F\\). " +
                     "Code: use fenced code blocks with language, like ```js ...```, and `inline code` for short snippets. " +
                     "Do NOT output raw HTML. " +
-                    "Yuqi-mode: use only evidence from CTX/FILE/HIS; never invent. If CTX has Q/A blocks (【问题】/【回答】), treat 【回答】 as strong evidence and you may polish. " +
-                    "If asked for a number but evidence only supports a status/statement, answer the supported status/statement. " +
-                    "If a Yuqi-mode question lacks evidence, reply exactly: \"" + OUT_OF_SCOPE_REPLY + "\". " +
-                    "General-mode: for common sense/general knowledge/how-to/coding/science, answer normally even if CTX/FILE/HIS are empty or irrelevant.";
+                    "When CTX/FILE/HIS are available, ground your answer in that evidence; if evidence only supports a status/statement, respond with the supported information.";
 
     private static final int MAX_KEY_INFO = 6;
     private static final int MAX_EVIDENCE_PREVIEW_CHARS = 1000;
@@ -229,94 +226,6 @@ public class RagAnswerService {
         return RagAnswerRequest.ScopeMode.PRIVACY_SAFE;
     }
 
-    /** Heuristic privacy request detector (English + Chinese keywords). */
-    private static boolean looksLikePrivacyRequest(String question) {
-        if (question == null || question.isBlank()) return false;
-        String q = question.toLowerCase(Locale.ROOT);
-
-        // English
-        String[] en = {
-                "phone", "mobile", "cell", "email", "e-mail", "address", "home address", "location",
-                "ssn", "social security", "passport", "driver license", "dob", "date of birth", "birthday",
-                "bank", "account number", "routing", "credit card", "debit card",
-                "salary", "compensation", "pay", "w2", "tax", "immigration", "visa", "h1b", "green card",
-                "wechat", "whatsapp", "telegram", "contact",
-                "girlfriend", "boyfriend", "wife", "husband", "family", "parents", "kids", "children",
-                "medical", "health", "diagnosis", "mental", "therapy",
-                "criminal", "record", "arrest", "court", "lawsuit",
-                "pii", "personally identifiable",
-                "instagram", "wechat id", "handle", "联系方式"
-        };
-        for (String k : en) {
-            if (q.contains(k)) return true;
-        }
-
-        // Chinese
-        String[] zh = {
-                "电话", "手机号", "手机", "邮箱", "电子邮件", "地址", "住址", "家庭住址", "定位", "位置",
-                "身份证", "社安号", "社会安全号", "护照", "驾照", "出生日期", "生日",
-                "银行卡", "账号", "账户", "路由号", "信用卡",
-                "工资", "薪水", "收入", "税", "移民", "签证", "绿卡",
-                "微信", "联系", "联系方式", "隐私",
-                "女朋友", "男朋友", "老婆", "老公", "家人", "父母", "孩子",
-                "健康", "疾病", "病史", "诊断", "心理", "精神",
-                "犯罪", "前科", "逮捕", "诉讼", "官司",
-                "社交账号", "微信号", "账号"
-        };
-        for (String k : zh) {
-            if (question.contains(k)) return true;
-        }
-        return false;
-    }
-
-    /**
-     * Heuristic: whether this question is likely "Yuqi-mode" (about the user's personal background/projects).
-     * Used only to tighten "no hallucination" behavior when evidence is missing.
-     */
-    private static boolean looksLikeYuqiQuestion(String question, IntentDetectTools.IntentResult intentResult) {
-        if (question == null || question.isBlank()) return false;
-
-        String qLower = question.toLowerCase(Locale.ROOT);
-
-        // Direct name markers
-        if (qLower.contains("yuqi") || qLower.contains("mr pot") || qLower.contains("mrpot")) return true;
-        if (question.contains("郭育奇") || question.contains("蔡宇轩")) return true;
-
-        // Intent tool hint (best-effort; tool may evolve)
-        if (intentResult != null) {
-            String intent = String.valueOf(intentResult.intent()).toLowerCase(Locale.ROOT);
-            if (intent.contains("yuqi") || intent.contains("resume") || intent.contains("profile")
-                    || intent.contains("personal") || intent.contains("self") || intent.contains("portfolio")) {
-                return true;
-            }
-            if (intentResult.signals() != null) {
-                for (String s : intentResult.signals()) {
-                    if (s == null) continue;
-                    String sl = s.toLowerCase(Locale.ROOT);
-                    if (sl.contains("yuqi") || sl.contains("resume") || sl.contains("profile")
-                            || sl.contains("portfolio") || sl.contains("self") || sl.contains("personal")) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        // Pronoun + user-profile keywords
-        if (qLower.matches(".*\\b(i|me|my)\\b.*")) {
-            if (qLower.contains("resume") || qLower.contains("cv") || qLower.contains("experience")
-                    || qLower.contains("project") || qLower.contains("portfolio") || qLower.contains("job")) {
-                return true;
-            }
-        }
-        if (question.contains("我的")) {
-            if (question.contains("简历") || question.contains("项目") || question.contains("经历")
-                    || question.contains("作品集") || question.contains("工作") || question.contains("面试")) {
-                return true;
-            }
-        }
-
-        return false;
-    }
 
     // --------------------------
     // Blocking answer
@@ -675,8 +584,7 @@ public class RagAnswerService {
                 .flatMap(tuple -> {
                     RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
                     PreparedContext ctx = tuple.getT2();
-                    boolean outOfScope = ctx.scopeGuardResult != null && !ctx.scopeGuardResult.scoped()
-                            && looksLikePrivacyRequest(request.question());
+                    boolean outOfScope = ctx.scopeGuardResult != null && !ctx.scopeGuardResult.scoped();
                     String status = outOfScope ? "out_of_scope" : (ctx.hasAnyRef ? "" : "no_evidence");
                     String roadmapSummary = String.join(" -> ", plan.steps());
                     return Mono.fromCallable(() -> trackCorrectTools.ensure(request.question(), roadmapSummary, status))
@@ -1803,56 +1711,22 @@ public class RagAnswerService {
         ScopeGuardTools.ScopeGuardResult guard0 = scopeGuardResult == null
                 ? ScopeGuardTools.ScopeGuardResult.scopedDefault()
                 : scopeGuardResult;
-
-        boolean privacyRequest = looksLikePrivacyRequest(question);
-
-        // Some older ScopeGuard implementations may mark non-Yuqi / general questions as "unscoped".
-        // We ONLY treat unscoped as blocking when the user is actually requesting private/personal info.
-        boolean guardSaysSensitive = false;
-        if (guard0 != null) {
-            String r = Optional.ofNullable(guard0.reason()).orElse("").toLowerCase(Locale.ROOT);
-            String h = Optional.ofNullable(guard0.rewriteHint()).orElse("").toLowerCase(Locale.ROOT);
-            guardSaysSensitive = r.contains("private") || r.contains("privacy") || r.contains("contact") || r.contains("pii")
-                    || h.contains("private") || h.contains("privacy") || h.contains("contact") || h.contains("pii");
-        }
-
-        boolean guardBlocks = (guard0 != null && !guard0.scoped() && (privacyRequest || guardSaysSensitive));
-        ScopeGuardTools.ScopeGuardResult guard = guardBlocks ? guard0 : ScopeGuardTools.ScopeGuardResult.scopedDefault();
+        ScopeGuardTools.ScopeGuardResult guard = guard0 == null
+                ? ScopeGuardTools.ScopeGuardResult.scopedDefault()
+                : guard0;
 
         List<String> safeTerms = entityTerms == null ? List.of() : entityTerms;
 
         List<QaCandidate> qaCandidates = extractQaCandidates(retrieval, question);
-
-        boolean yuqiModeQuestion = looksLikeYuqiQuestion(question, intentResult);
 
         StringBuilder sb = new StringBuilder();
 
         sb.append("Meta: noEvidence=").append(noEvidence)
                 .append(", kbWeak=").append(outOfScopeKb)
                 .append(", scopeScoped=").append(guard.scoped())
-                .append(", privacyRequest=").append(privacyRequest)
-                .append(", yuqiMode=").append(yuqiModeQuestion)
                 .append(", deepThinking=").append(deepThinking)
                 .append(", scopeMode=").append(scopeMode)
                 .append("\n\n");
-
-        if (guardBlocks) {
-            if (guard.reason() != null && !guard.reason().isBlank()) {
-                sb.append("Scope note: ").append(guard.reason()).append("\n\n");
-            }
-            if (guard.rewriteHint() != null && !guard.rewriteHint().isBlank()) {
-                sb.append("Rewrite hint: ").append(guard.rewriteHint()).append("\n\n");
-            }
-            sb.append("Instruction: refuse to provide Yuqi's private/personal details (no contact info, IDs, exact address, SSN, etc.). ")
-                    .append("Offer safe alternatives: general public/professional topics or ask the user to provide the needed info.\n\n");
-        }
-
-        // If this is a Yuqi-mode question but evidence is weak/empty, force the strict fallback to avoid hallucination.
-        if (yuqiModeQuestion && !guardBlocks && (noEvidence || outOfScopeKb)) {
-            sb.append("Instruction: Yuqi-mode + insufficient evidence => reply exactly with ")
-                    .append(OUT_OF_SCOPE_REPLY)
-                    .append(".\n\n");
-        }
         String fileSection = truncate(Optional.ofNullable(fileText).orElse(""), MAX_FILE_CONTEXT_CHARS);
         if (!fileSection.isBlank()) {
             sb.append(fileSection).append("\n\n");
