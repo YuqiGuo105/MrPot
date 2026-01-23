@@ -11,7 +11,9 @@ import com.example.MrPot.tools.EntityResolveTools;
 import com.example.MrPot.tools.EvidenceGapTools;
 import com.example.MrPot.tools.EvidenceRerankTools;
 import com.example.MrPot.tools.FileTools;
+import com.example.MrPot.tools.IntentDetectTools;
 import com.example.MrPot.tools.KbTools;
+import com.example.MrPot.tools.KeywordExtractTools;
 import com.example.MrPot.tools.MemoryTools;
 import com.example.MrPot.tools.PrivacySanitizerTools;
 import com.example.MrPot.tools.QuestionDecomposerTools;
@@ -59,6 +61,8 @@ public class RagAnswerService {
     private final AnswerOutlineTools answerOutlineTools;
     private final AssumptionCheckTools assumptionCheckTools;
     private final ActionPlanTools actionPlanTools;
+    private final IntentDetectTools intentDetectTools;
+    private final KeywordExtractTools keywordExtractTools;
     private final RedisChatMemoryService chatMemoryService;
     private final Map<String, ChatClient> chatClients;
 
@@ -71,6 +75,42 @@ public class RagAnswerService {
     private static final double MIN_KB_SCORE_FOR_ANSWER = 0.15;
 
     private static final String OUT_OF_SCOPE_REPLY = "I can only answer Yuqi's related stuff.";
+
+    // --------------------------
+    // Out-of-scope memory guard
+    // --------------------------
+
+    /**
+     * True if the assistant output is the out-of-scope reply (with or without surrounding quotes).
+     * We avoid saving this into memory to prevent the model from repeatedly parroting it.
+     */
+    private static boolean isOutOfScopeReply(String answer) {
+        if (answer == null) return false;
+        String a = answer.trim();
+        if (a.equals(OUT_OF_SCOPE_REPLY)) return true;
+        // Some models include surrounding quotes because the system prompt shows a quoted literal.
+        if (a.equals("\"" + OUT_OF_SCOPE_REPLY + "\"")) return true;
+        return false;
+    }
+
+    /**
+     * Remove the out-of-scope reply from the HIS section so it doesn't bias future turns.
+     * This is backward compatible with sessions that already stored the refusal in history.
+     */
+    private static String sanitizeHistoryForPrompt(String history) {
+        if (history == null || history.isBlank()) return "";
+        String[] lines = history.split("\\r?\\n");
+        StringBuilder sb = new StringBuilder();
+        for (String line : lines) {
+            if (line != null && line.contains(OUT_OF_SCOPE_REPLY)) {
+                continue;
+            }
+            sb.append(line).append("\n");
+        }
+        // Compress extra blank lines
+        return sb.toString().replaceAll("\\n{3,}", "\n\n").trim();
+    }
+
 
     // Prompt budgets
     private static final int MAX_HISTORY_CHARS = 2500;
@@ -129,7 +169,9 @@ public class RagAnswerService {
             EvidenceGapTools.EvidenceGapResult evidenceGap,
             AnswerOutlineTools.OutlineResult answerOutline,
             AssumptionCheckTools.AssumptionResult assumptionResult,
-            ActionPlanTools.ActionPlanResult actionPlan
+            ActionPlanTools.ActionPlanResult actionPlan,
+            IntentDetectTools.IntentResult intentResult,
+            KeywordExtractTools.KeywordResult keywordResult
     ) { }
 
     private record SanitizedEvidence(
@@ -149,19 +191,43 @@ public class RagAnswerService {
     }
 
     private static final String SYSTEM_PROMPT =
-            "You are Mr Pot, Yuqi's assistant and a general-purpose helpful AI. " +
-                    "Reply in the user's language. Be friendly, slightly playful, and human-like (no insults; no made-up facts). " +
-                    "Scope: if the question is about Yuqi (his blog/projects/work/background/private facts) => Yuqi-mode; otherwise General-mode. " +
-                    "Output: Prefer plain text for short/simple replies. Use WYSIWYG HTML only when needed for structure (multiple paragraphs/lists/tables) or notation (formulas). " +
-                    "WYSIWYG rules: return a single HTML fragment (no Markdown, no outer <html>/<body>). Use <p>, <br>, <ul><li>, <strong>/<em>, <code>, <pre><code>, and <sup>/<sub>. " +
-                    "Safety: never include <script>/<style>/<iframe> or inline event handlers. " +
+            "You are Mr Pot, a general-purpose helpful AI assistant. " +
+                    "Reply in the user's language. Be friendly, slightly playful, and human-like. " +
+                    "Privacy: if the user asks for Yuqi's private/personal details, refuse with a light humorous response and offer safe alternatives or public/professional topics. " +
+                    "Otherwise answer normally like a standard LLM agent. " +
                     "Yuqi-mode: use only evidence from CTX/FILE/HIS; never invent. If CTX has Q/A blocks (【问题】/【回答】), treat 【回答】 as strong evidence and you may polish. " +
                     "If asked for a number but evidence only supports a status/statement, answer the supported status/statement. " +
-                    "If a Yuqi-mode question lacks evidence, reply exactly: \"" + OUT_OF_SCOPE_REPLY + "\". " +
-                    "General-mode: for common sense/general knowledge/how-to/coding/science, answer normally even if CTX/FILE/HIS are empty or irrelevant.";
+                    "Output: Prefer plain text for short/simple replies. Use Markdown (GitHub Flavored Markdown) when structure/formatting is needed (multiple paragraphs/lists/tables/headings/quotes). " +
+                    "Formatting: keep clear paragraphs with blank lines. Use **bold**, _italic_, bullet/ordered lists, blockquotes (>), and separators (---) when helpful. " +
+                    "Science: use LaTeX delimiters: inline \\(...\\), block \\[...\\] or $$...$$. " +
+                    "Normalization: if the user writes a formula in [ ... ], convert it to block LaTeX \\[ ... \\]. If the user writes variables like ( F ), convert them to inline LaTeX \\(F\\). " +
+                    "Code: use fenced code blocks with language, like ```js ...```, and `inline code` for short snippets. " +
+                    "Do NOT output raw HTML. " +
+                    "When CTX/FILE/HIS are available, ground your answer in that evidence; if evidence only supports a status/statement, respond with the supported information.";
 
     private static final int MAX_KEY_INFO = 6;
     private static final int MAX_EVIDENCE_PREVIEW_CHARS = 1000;
+
+    // --------------------------
+    // Scope handling
+    // --------------------------
+
+    /**
+     * Deep-thinking mode should be no more restrictive than regular mode:
+     * - Always answer general questions normally (General-mode).
+     * - Only refuse when the user asks for Yuqi's private/personal details.
+     *
+     * We therefore default deepThinking to PRIVACY_SAFE, regardless of requested scopeMode.
+     * If you truly want strict "Yuqi-only" behavior, keep deepThinking=false and set scopeMode=YUQI_ONLY.
+     */
+    private static RagAnswerRequest.ScopeMode resolveEffectiveScopeMode(RagAnswerRequest.ScopeMode requested,
+                                                                        boolean deepThinking) {
+        if (!deepThinking) {
+            return requested == null ? RagAnswerRequest.ScopeMode.PRIVACY_SAFE : requested;
+        }
+        return RagAnswerRequest.ScopeMode.PRIVACY_SAFE;
+    }
+
 
     // --------------------------
     // Blocking answer
@@ -174,9 +240,11 @@ public class RagAnswerService {
         double minScore = request.resolveMinScore(DEFAULT_MIN_SCORE);
         String model = request.resolveModel();
         boolean deepThinking = request.resolveDeepThinking(false);
-        RagAnswerRequest.ScopeMode scopeMode = request.resolveScopeMode();
 
-        PreparedContext ctx = prepareContextMono(request, topK, minScore, deepThinking)
+        RagAnswerRequest.ScopeMode requestedScopeMode = request.resolveScopeMode();
+        RagAnswerRequest.ScopeMode scopeMode = resolveEffectiveScopeMode(requestedScopeMode, deepThinking);
+
+        PreparedContext ctx = prepareContextMono(request, topK, minScore, deepThinking, scopeMode)
                 .blockOptional()
                 .orElse(new PreparedContext(
                         new RagRetrievalResult("", List.of(), ""),
@@ -191,12 +259,16 @@ public class RagAnswerService {
                         new EvidenceGapTools.EvidenceGapResult(List.of(), List.of(), "skipped"),
                         new AnswerOutlineTools.OutlineResult(List.of(), "bullets"),
                         new AssumptionCheckTools.AssumptionResult(List.of(), "low"),
-                        new ActionPlanTools.ActionPlanResult(List.of(), "bullets")
+                        new ActionPlanTools.ActionPlanResult(List.of(), "bullets"),
+                        new IntentDetectTools.IntentResult("general", List.of()),
+                        new KeywordExtractTools.KeywordResult(List.of(), "none")
                 ));
+        ToolRunSummary toolSummary = buildToolSummary(ctx, null);
 
         ChatClient chatClient = resolveClient(model);
 
-        String historyText = truncate(memoryTools.recent(session.id(), MAX_HISTORY_TURNS), MAX_HISTORY_CHARS);
+        String rawHistory = memoryTools.recent(session.id(), MAX_HISTORY_TURNS);
+        String historyText = truncate(sanitizeHistoryForPrompt(rawHistory), MAX_HISTORY_CHARS);
 
         boolean noEvidence = !ctx.hasAnyRef;
         String prompt = buildPrompt(
@@ -215,7 +287,9 @@ public class RagAnswerService {
                 ctx.evidenceGap,
                 ctx.answerOutline,
                 ctx.assumptionResult,
-                ctx.actionPlan
+                ctx.actionPlan,
+                ctx.intentResult,
+                ctx.keywordResult
         );
 
         String answer;
@@ -231,15 +305,18 @@ public class RagAnswerService {
             error = ex.toString();
             int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
             safeLogOnce(session.id(), request.question(), model, topK, minScore,
-                    answer, latencyMs, noEvidence, error, ctx.retrieval);
+                    answer, latencyMs, noEvidence, error, ctx.retrieval, toolSummary);
             throw ex;
         }
 
-        chatMemoryService.appendTurn(session.id(), request.question(), answer, session.temporary());
+        // Do NOT save the out-of-scope reply into memory; it will cause the model to parrot it.
+        if (!isOutOfScopeReply(answer)) {
+            chatMemoryService.appendTurn(session.id(), request.question(), answer, session.temporary());
+        }
 
         int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
         safeLogOnce(session.id(), request.question(), model, topK, minScore,
-                answer, latencyMs, noEvidence, null, ctx.retrieval);
+                answer, latencyMs, noEvidence, null, ctx.retrieval, toolSummary);
 
         return new RagAnswer(answer, ctx.retrieval == null ? List.of() : ctx.retrieval.documents());
     }
@@ -255,33 +332,38 @@ public class RagAnswerService {
         double minScore = request.resolveMinScore(DEFAULT_MIN_SCORE);
         String model = request.resolveModel();
         boolean deepThinking = request.resolveDeepThinking(false);
-        RagAnswerRequest.ScopeMode scopeMode = request.resolveScopeMode();
+        RagAnswerRequest.ScopeMode requestedScopeMode = request.resolveScopeMode();
+        RagAnswerRequest.ScopeMode scopeMode = resolveEffectiveScopeMode(requestedScopeMode, deepThinking);
 
-        return prepareContextMono(request, topK, minScore, deepThinking)
+        return prepareContextMono(request, topK, minScore, deepThinking, scopeMode)
                 .flatMapMany(ctx -> {
                     ChatClient chatClient = resolveClient(model);
+                    ToolRunSummary toolSummary = buildToolSummary(ctx, null);
 
-                    String historyText = truncate(memoryTools.recent(session.id(), MAX_HISTORY_TURNS), MAX_HISTORY_CHARS);
+                    String rawHistory = memoryTools.recent(session.id(), MAX_HISTORY_TURNS);
+                    String historyText = truncate(sanitizeHistoryForPrompt(rawHistory), MAX_HISTORY_CHARS);
 
                     boolean noEvidence = !ctx.hasAnyRef;
                     String prompt = buildPrompt(
                             request.question(),
                             ctx.retrieval,
                             historyText,
-                                    ctx.fileText,
-                                    noEvidence,
-                                    ctx.outOfScopeKb,
-                                    deepThinking,
-                                    scopeMode,
-                                    ctx.scopeGuardResult,
-                                    ctx.entityTerms,
-                                    ctx.compressedContext,
-                                    ctx.keyInfo,
-                                    ctx.evidenceGap,
-                                    ctx.answerOutline,
-                                    ctx.assumptionResult,
-                                    ctx.actionPlan
-                            );
+                            ctx.fileText,
+                            noEvidence,
+                            ctx.outOfScopeKb,
+                            deepThinking,
+                            scopeMode,
+                            ctx.scopeGuardResult,
+                            ctx.entityTerms,
+                            ctx.compressedContext,
+                            ctx.keyInfo,
+                            ctx.evidenceGap,
+                            ctx.answerOutline,
+                            ctx.assumptionResult,
+                            ctx.actionPlan,
+                            ctx.intentResult,
+                            ctx.keywordResult
+                    );
 
                     AtomicReference<StringBuilder> aggregate = new AtomicReference<>(new StringBuilder());
                     AtomicReference<String> errorRef = new AtomicReference<>(null);
@@ -295,12 +377,16 @@ public class RagAnswerService {
                             .doOnError(ex -> errorRef.set(ex.toString()))
                             .doFinally(signalType -> {
                                 String finalAnswer = aggregate.get().toString();
-                                chatMemoryService.appendTurn(session.id(), request.question(), finalAnswer, session.temporary());
+
+                                // Do NOT save the out-of-scope reply into memory; it will cause the model to parrot it.
+                                if (!isOutOfScopeReply(finalAnswer)) {
+                                    chatMemoryService.appendTurn(session.id(), request.question(), finalAnswer, session.temporary());
+                                }
 
                                 Mono.fromRunnable(() -> {
                                             int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
                                             safeLogOnce(session.id(), request.question(), model, topK, minScore,
-                                                    finalAnswer, latencyMs, noEvidence, errorRef.get(), ctx.retrieval);
+                                                    finalAnswer, latencyMs, noEvidence, errorRef.get(), ctx.retrieval, toolSummary);
                                         })
                                         .subscribeOn(Schedulers.boundedElastic())
                                         .subscribe();
@@ -319,7 +405,8 @@ public class RagAnswerService {
         double minScore = request.resolveMinScore(DEFAULT_MIN_SCORE);
         String model = request.resolveModel();
         boolean deepThinking = request.resolveDeepThinking(false);
-        RagAnswerRequest.ScopeMode scopeMode = request.resolveScopeMode();
+        RagAnswerRequest.ScopeMode requestedScopeMode = request.resolveScopeMode();
+        RagAnswerRequest.ScopeMode scopeMode = resolveEffectiveScopeMode(requestedScopeMode, deepThinking);
         ChatClient chatClient = resolveClient(model);
 
         List<String> urls = request.resolveFileUrls(MAX_FILE_URLS);
@@ -328,6 +415,8 @@ public class RagAnswerService {
         AtomicReference<Boolean> noEvidenceRef = new AtomicReference<>(false);
         AtomicReference<RagRetrievalResult> retrievalRef = new AtomicReference<>(null);
         AtomicReference<String> errorRef = new AtomicReference<>(null);
+        AtomicReference<PreparedContext> ctxRef = new AtomicReference<>(null);
+        AtomicReference<TrackCorrectTools.TrackResult> trackCorrectRef = new AtomicReference<>(null);
 
         Mono<String> historyMono =
                 Mono.fromCallable(() -> memoryTools.recent(session.id(), MAX_HISTORY_TURNS))
@@ -336,8 +425,8 @@ public class RagAnswerService {
 
         Mono<RoadmapPlannerTools.RoadmapPlan> roadmapPlanMono = deepThinking
                 ? Mono.fromCallable(() -> roadmapPlannerTools.plan(request.question(), scopeMode, true, !urls.isEmpty()))
-                        .subscribeOn(Schedulers.boundedElastic())
-                        .cache()
+                .subscribeOn(Schedulers.boundedElastic())
+                .cache()
                 : Mono.just(defaultRoadmapPlan(!urls.isEmpty()));
 
         Mono<List<String>> decomposeMono = roadmapPlanMono.flatMap(plan -> {
@@ -364,8 +453,8 @@ public class RagAnswerService {
 
         Mono<ScopeGuardTools.ScopeGuardResult> scopeGuardMono = deepThinking
                 ? Mono.fromCallable(() -> scopeGuardTools.guard(request.question()))
-                        .subscribeOn(Schedulers.boundedElastic())
-                        .cache()
+                .subscribeOn(Schedulers.boundedElastic())
+                .cache()
                 : Mono.just(ScopeGuardTools.ScopeGuardResult.scopedDefault());
 
         Mono<EntityResolveTools.EntityResolveResult> entityResolveMono = Mono.zip(roadmapPlanMono, fileTextMono)
@@ -410,6 +499,20 @@ public class RagAnswerService {
         Mono<List<String>> keyInfoMono = sanitizeMono.map(sanitized ->
                         extractKeyInfo(sanitized.combined(), MAX_KEY_INFO))
                 .defaultIfEmpty(List.of())
+                .cache();
+
+        Mono<IntentDetectTools.IntentResult> intentMono = Mono.fromCallable(() -> intentDetectTools.detect(request.question()))
+                .subscribeOn(Schedulers.boundedElastic())
+                .cache();
+
+        Mono<KeywordExtractTools.KeywordResult> keywordMono = Mono.zip(keyInfoMono, entityResolveMono)
+                .map(tuple -> {
+                    List<String> keyInfo = tuple.getT1();
+                    EntityResolveTools.EntityResolveResult entity = tuple.getT2();
+                    List<String> terms = (entity == null || entity.terms() == null) ? List.of() : entity.terms();
+                    return keywordExtractTools.extract(request.question(), keyInfo, terms, 10);
+                })
+                .subscribeOn(Schedulers.boundedElastic())
                 .cache();
 
         Mono<EvidenceGapTools.EvidenceGapResult> gapMono = Mono.zip(roadmapPlanMono, sanitizeMono, keyInfoMono)
@@ -471,11 +574,13 @@ public class RagAnswerService {
                 compressedMono,
                 sanitizeMono,
                 keyInfoMono,
+                intentMono,
+                keywordMono,
                 gapMono,
                 outlineMono,
                 assumptionMono,
                 actionPlanMono
-        ).cache();
+        ).doOnNext(ctxRef::set).cache();
 
         Mono<TrackCorrectTools.TrackResult> trackCorrectMono = Mono.zip(roadmapPlanMono, preparedContextMono)
                 .flatMap(tuple -> {
@@ -487,6 +592,7 @@ public class RagAnswerService {
                     return Mono.fromCallable(() -> trackCorrectTools.ensure(request.question(), roadmapSummary, status))
                             .subscribeOn(Schedulers.boundedElastic());
                 })
+                .doOnNext(trackCorrectRef::set)
                 .cache();
 
         Flux<ThinkingEvent> startStep = Flux.just(
@@ -516,17 +622,17 @@ public class RagAnswerService {
 
         Flux<ThinkingEvent> questionDecomposeStep = deepThinking
                 ? Mono.zip(roadmapPlanMono, decomposeMono).flatMapMany(tuple -> {
-                    RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
-                    List<String> decomposed = tuple.getT2();
-                    if (!plan.useQuestionDecompose() || decomposed == null || decomposed.isEmpty()) {
-                        return Flux.empty();
-                    }
-                    return Flux.just(new ThinkingEvent(
-                            "question_decompose",
-                            "Question decomposition",
-                            Map.of("subQuestions", decomposed)
-                    ));
-                })
+            RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
+            List<String> decomposed = tuple.getT2();
+            if (!plan.useQuestionDecompose() || decomposed == null || decomposed.isEmpty()) {
+                return Flux.empty();
+            }
+            return Flux.just(new ThinkingEvent(
+                    "question_decompose",
+                    "Question decomposition",
+                    Map.of("subQuestions", decomposed)
+            ));
+        })
                 : Flux.empty();
 
         Flux<ThinkingEvent> fileFetchStartStep = roadmapPlanMono.flatMapMany(plan -> {
@@ -585,15 +691,15 @@ public class RagAnswerService {
 
         Flux<ThinkingEvent> entityResolveStep = deepThinking
                 ? Mono.zip(roadmapPlanMono, entityResolveMono).flatMapMany(tuple -> {
-                    RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
-                    EntityResolveTools.EntityResolveResult result = tuple.getT2();
-                    if (!plan.useEntityResolve()) return Flux.empty();
-                    return Flux.just(new ThinkingEvent(
-                            "entity_resolve",
-                            "Entity resolution",
-                            Map.of("terms", result.terms())
-                    ));
-                })
+            RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
+            EntityResolveTools.EntityResolveResult result = tuple.getT2();
+            if (!plan.useEntityResolve()) return Flux.empty();
+            return Flux.just(new ThinkingEvent(
+                    "entity_resolve",
+                    "Entity resolution",
+                    Map.of("terms", result.terms())
+            ));
+        })
                 : Flux.empty();
 
         Flux<ThinkingEvent> codeSearchStep = deepThinking ? codeSearchMono.flatMapMany(result ->
@@ -628,15 +734,15 @@ public class RagAnswerService {
 
         Flux<ThinkingEvent> contextCompressStep = deepThinking
                 ? Mono.zip(roadmapPlanMono, compressedMono).flatMapMany(tuple -> {
-                    RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
-                    String summary = tuple.getT2();
-                    if (!plan.useCompress()) return Flux.empty();
-                    return Flux.just(new ThinkingEvent(
-                            "context_compress",
-                            "Compressed context",
-                            Map.of("preview", truncate(summary, PROGRESS_EXCERPT_CHARS))
-                    ));
-                })
+            RoadmapPlannerTools.RoadmapPlan plan = tuple.getT1();
+            String summary = tuple.getT2();
+            if (!plan.useCompress()) return Flux.empty();
+            return Flux.just(new ThinkingEvent(
+                    "context_compress",
+                    "Compressed context",
+                    Map.of("preview", truncate(summary, PROGRESS_EXCERPT_CHARS))
+            ));
+        })
                 : Flux.empty();
 
         Flux<ThinkingEvent> privacyStep = deepThinking ? sanitizeMono.flatMapMany(sanitized ->
@@ -667,6 +773,22 @@ public class RagAnswerService {
 
         Flux<ThinkingEvent> keyInfoStep = deepThinking ? keyInfoMono.flatMapMany(keyInfo ->
                 Flux.just(new ThinkingEvent("key_info", "Key info", Map.of("items", keyInfo)))
+        ) : Flux.empty();
+
+        Flux<ThinkingEvent> intentStep = deepThinking ? intentMono.flatMapMany(result ->
+                Flux.just(new ThinkingEvent(
+                        "intent_detect",
+                        "Intent detection",
+                        Map.of("intent", result.intent(), "signals", result.signals())
+                ))
+        ) : Flux.empty();
+
+        Flux<ThinkingEvent> keywordStep = deepThinking ? keywordMono.flatMapMany(result ->
+                Flux.just(new ThinkingEvent(
+                        "keyword_extract",
+                        "Keyword extraction",
+                        Map.of("keywords", result.keywords(), "source", result.source())
+                ))
         ) : Flux.empty();
 
         Flux<ThinkingEvent> evidenceGapStep = deepThinking ? gapMono.flatMapMany(result ->
@@ -736,7 +858,7 @@ public class RagAnswerService {
                             boolean noEvidence = !ctx.hasAnyRef;
                             noEvidenceRef.set(noEvidence);
 
-                            String historyText = truncate(history, MAX_HISTORY_CHARS);
+                            String historyText = truncate(sanitizeHistoryForPrompt(history), MAX_HISTORY_CHARS);
                             String prompt = buildPrompt(
                                     request.question(),
                                     ctx.retrieval,
@@ -753,7 +875,9 @@ public class RagAnswerService {
                                     ctx.evidenceGap,
                                     ctx.answerOutline,
                                     ctx.assumptionResult,
-                                    ctx.actionPlan
+                                    ctx.actionPlan,
+                                    ctx.intentResult,
+                                    ctx.keywordResult
                             );
 
                             return chatClient.prompt()
@@ -769,7 +893,11 @@ public class RagAnswerService {
                         .doOnError(ex -> errorRef.set(ex.toString()))
                         .doFinally(signalType -> {
                             String finalAnswer = aggregate.get().toString();
-                            chatMemoryService.appendTurn(session.id(), request.question(), finalAnswer, session.temporary());
+
+                            // Do NOT save the out-of-scope reply into memory; it will cause the model to parrot it.
+                            if (!isOutOfScopeReply(finalAnswer)) {
+                                chatMemoryService.appendTurn(session.id(), request.question(), finalAnswer, session.temporary());
+                            }
 
                             Mono.fromRunnable(() -> {
                                         int latencyMs = (int) ((System.nanoTime() - t0) / 1_000_000);
@@ -783,7 +911,8 @@ public class RagAnswerService {
                                                 latencyMs,
                                                 Boolean.TRUE.equals(noEvidenceRef.get()),
                                                 errorRef.get(),
-                                                retrievalRef.get()
+                                                retrievalRef.get(),
+                                                buildToolSummary(ctxRef.get(), trackCorrectRef.get())
                                         );
                                     })
                                     .subscribeOn(Schedulers.boundedElastic())
@@ -796,22 +925,22 @@ public class RagAnswerService {
 
         Flux<ThinkingEvent> answerVerifyStep = deepThinking
                 ? conflictMono.flatMapMany(result -> {
-                    List<String> issues = new ArrayList<>();
-                    if (Boolean.TRUE.equals(noEvidenceRef.get())) {
-                        issues.add("no_evidence");
-                    }
-                    if (result != null && result.conflict()) {
-                        issues.addAll(result.issues());
-                    }
-                    return Flux.just(new ThinkingEvent(
-                            "answer_verify",
-                            "Answer verification",
-                            Map.of(
-                                    "supportScore", verifySupportScore(noEvidenceRef.get()),
-                                    "issues", issues
-                            )
-                    ));
-                })
+            List<String> issues = new ArrayList<>();
+            if (Boolean.TRUE.equals(noEvidenceRef.get())) {
+                issues.add("no_evidence");
+            }
+            if (result != null && result.conflict()) {
+                issues.addAll(result.issues());
+            }
+            return Flux.just(new ThinkingEvent(
+                    "answer_verify",
+                    "Answer verification",
+                    Map.of(
+                            "supportScore", verifySupportScore(noEvidenceRef.get()),
+                            "issues", issues
+                    )
+            ));
+        })
                 : Flux.empty();
 
         return Flux.concat(
@@ -833,6 +962,8 @@ public class RagAnswerService {
                 kbDocsStep,
                 contextCompressStep,
                 keyInfoStep,
+                intentStep,
+                keywordStep,
                 evidenceGapStep,
                 answerOutlineStep,
                 assumptionCheckStep,
@@ -847,14 +978,14 @@ public class RagAnswerService {
     // --------------------------
     // Context preparation (shared)
     // --------------------------
-    private Mono<PreparedContext> prepareContextMono(RagAnswerRequest request, int topK, double minScore, boolean deepThinking) {
+    private Mono<PreparedContext> prepareContextMono(RagAnswerRequest request, int topK, double minScore, boolean deepThinking,
+                                                     RagAnswerRequest.ScopeMode scopeMode) {
         List<String> urls = request.resolveFileUrls(MAX_FILE_URLS);
-        RagAnswerRequest.ScopeMode scopeMode = request.resolveScopeMode();
 
         Mono<RoadmapPlannerTools.RoadmapPlan> roadmapPlanMono = deepThinking
                 ? Mono.fromCallable(() -> roadmapPlannerTools.plan(request.question(), scopeMode, true, !urls.isEmpty()))
-                        .subscribeOn(Schedulers.boundedElastic())
-                        .cache()
+                .subscribeOn(Schedulers.boundedElastic())
+                .cache()
                 : Mono.just(defaultRoadmapPlan(!urls.isEmpty()));
 
         Mono<List<String>> decomposeMono = roadmapPlanMono.flatMap(plan -> {
@@ -873,8 +1004,8 @@ public class RagAnswerService {
 
         Mono<ScopeGuardTools.ScopeGuardResult> scopeGuardMono = deepThinking
                 ? Mono.fromCallable(() -> scopeGuardTools.guard(request.question()))
-                        .subscribeOn(Schedulers.boundedElastic())
-                        .cache()
+                .subscribeOn(Schedulers.boundedElastic())
+                .cache()
                 : Mono.just(ScopeGuardTools.ScopeGuardResult.scopedDefault());
 
         Mono<EntityResolveTools.EntityResolveResult> entityResolveMono = Mono.zip(roadmapPlanMono, fileTextMono)
@@ -918,6 +1049,20 @@ public class RagAnswerService {
         Mono<List<String>> keyInfoMono = sanitizeMono.map(sanitized ->
                         extractKeyInfo(sanitized.combined(), MAX_KEY_INFO))
                 .defaultIfEmpty(List.of())
+                .cache();
+
+        Mono<IntentDetectTools.IntentResult> intentMono = Mono.fromCallable(() -> intentDetectTools.detect(request.question()))
+                .subscribeOn(Schedulers.boundedElastic())
+                .cache();
+
+        Mono<KeywordExtractTools.KeywordResult> keywordMono = Mono.zip(keyInfoMono, entityResolveMono)
+                .map(tuple -> {
+                    List<String> keyInfo = tuple.getT1();
+                    EntityResolveTools.EntityResolveResult entity = tuple.getT2();
+                    List<String> terms = (entity == null || entity.terms() == null) ? List.of() : entity.terms();
+                    return keywordExtractTools.extract(request.question(), keyInfo, terms, 10);
+                })
+                .subscribeOn(Schedulers.boundedElastic())
                 .cache();
 
         Mono<EvidenceGapTools.EvidenceGapResult> gapMono = Mono.zip(roadmapPlanMono, sanitizeMono, keyInfoMono)
@@ -979,6 +1124,8 @@ public class RagAnswerService {
                 compressedMono,
                 sanitizeMono,
                 keyInfoMono,
+                intentMono,
+                keywordMono,
                 gapMono,
                 outlineMono,
                 assumptionMono,
@@ -1166,83 +1313,89 @@ public class RagAnswerService {
                                                           Mono<String> compressedMono,
                                                           Mono<SanitizedEvidence> sanitizedMono,
                                                           Mono<List<String>> keyInfoMono,
+                                                          Mono<IntentDetectTools.IntentResult> intentMono,
+                                                          Mono<KeywordExtractTools.KeywordResult> keywordMono,
                                                           Mono<EvidenceGapTools.EvidenceGapResult> gapMono,
                                                           Mono<AnswerOutlineTools.OutlineResult> outlineMono,
                                                           Mono<AssumptionCheckTools.AssumptionResult> assumptionMono,
                                                           Mono<ActionPlanTools.ActionPlanResult> actionPlanMono) {
         return Mono.zip(
-                        List.of(
-                                retrievalMono,
-                                fileTextMono,
-                                scopeGuardMono,
-                                entityResolveMono,
-                                compressedMono,
-                                sanitizedMono,
-                                keyInfoMono,
-                                gapMono,
-                                outlineMono,
-                                assumptionMono,
-                                actionPlanMono
-                        ),
-                        tuple -> {
-                            RagRetrievalResult retrieval = (RagRetrievalResult) tuple[0];
-                            String fileText = (String) tuple[1];
-                            ScopeGuardTools.ScopeGuardResult guard = (ScopeGuardTools.ScopeGuardResult) tuple[2];
-                            EntityResolveTools.EntityResolveResult entity = (EntityResolveTools.EntityResolveResult) tuple[3];
-                            String compressed = (String) tuple[4];
-                            SanitizedEvidence sanitized = (SanitizedEvidence) tuple[5];
-                            @SuppressWarnings("unchecked")
-                            List<String> keyInfo = (List<String>) tuple[6];
-                            EvidenceGapTools.EvidenceGapResult gapResult = (EvidenceGapTools.EvidenceGapResult) tuple[7];
-                            AnswerOutlineTools.OutlineResult outlineResult = (AnswerOutlineTools.OutlineResult) tuple[8];
-                            AssumptionCheckTools.AssumptionResult assumptionResult = (AssumptionCheckTools.AssumptionResult) tuple[9];
-                            ActionPlanTools.ActionPlanResult actionPlanResult = (ActionPlanTools.ActionPlanResult) tuple[10];
+                List.of(
+                        retrievalMono,
+                        fileTextMono,
+                        scopeGuardMono,
+                        entityResolveMono,
+                        compressedMono,
+                        sanitizedMono,
+                        keyInfoMono,
+                        intentMono,
+                        keywordMono,
+                        gapMono,
+                        outlineMono,
+                        assumptionMono,
+                        actionPlanMono
+                ),
+                tuple -> {
+                    RagRetrievalResult retrieval = (RagRetrievalResult) tuple[0];
+                    String fileText = (String) tuple[1];
+                    ScopeGuardTools.ScopeGuardResult guard = (ScopeGuardTools.ScopeGuardResult) tuple[2];
+                    EntityResolveTools.EntityResolveResult entity = (EntityResolveTools.EntityResolveResult) tuple[3];
+                    String compressed = (String) tuple[4];
+                    SanitizedEvidence sanitized = (SanitizedEvidence) tuple[5];
+                    @SuppressWarnings("unchecked")
+                    List<String> keyInfo = (List<String>) tuple[6];
+                    IntentDetectTools.IntentResult intentResult = (IntentDetectTools.IntentResult) tuple[7];
+                    KeywordExtractTools.KeywordResult keywordResult = (KeywordExtractTools.KeywordResult) tuple[8];
+                    EvidenceGapTools.EvidenceGapResult gapResult = (EvidenceGapTools.EvidenceGapResult) tuple[9];
+                    AnswerOutlineTools.OutlineResult outlineResult = (AnswerOutlineTools.OutlineResult) tuple[10];
+                    AssumptionCheckTools.AssumptionResult assumptionResult = (AssumptionCheckTools.AssumptionResult) tuple[11];
+                    ActionPlanTools.ActionPlanResult actionPlanResult = (ActionPlanTools.ActionPlanResult) tuple[12];
 
-                            boolean outOfScopeKb = isOutOfScope(retrieval);
-                            boolean hasAnyRef = hasAnyReference(retrieval, fileText);
+                    boolean outOfScopeKb = isOutOfScope(retrieval);
+                    boolean hasAnyRef = hasAnyReference(retrieval, fileText);
 
-                            if (deepThinking) {
-                                if (guard != null && !guard.scoped()) {
-                                    outOfScopeKb = true;
-                                    hasAnyRef = false;
-                                }
-                                if (!compressed.isBlank()) {
-                                    hasAnyRef = true;
-                                }
-                            }
+                    if (deepThinking) {
+                        // In deep-thinking mode we still allow answering general questions normally.
+                        // ScopeGuard only blocks *privacy* requests; it should not turn the whole turn into out-of-scope.
+                        if (!compressed.isBlank()) {
+                            hasAnyRef = true;
+                        }
+                    }
 
-                            if (scopeMode == RagAnswerRequest.ScopeMode.YUQI_ONLY && (guard == null || !guard.scoped())) {
-                                outOfScopeKb = true;
-                                hasAnyRef = false;
-                            }
+                    if (scopeMode == RagAnswerRequest.ScopeMode.YUQI_ONLY && (guard == null || !guard.scoped())) {
+                        outOfScopeKb = true;
+                        hasAnyRef = false;
+                    }
 
-                            List<String> entityTerms = (entity == null || entity.terms() == null)
-                                    ? List.of()
-                                    : entity.terms();
+                    List<String> entityTerms = (entity == null || entity.terms() == null)
+                            ? List.of()
+                            : entity.terms();
 
-                            RagRetrievalResult sanitizedRetrieval = new RagRetrievalResult(
-                                    retrieval.question(),
-                                    retrieval.documents(),
-                                    sanitized.context()
-                            );
+                    RagRetrievalResult sanitizedRetrieval = new RagRetrievalResult(
+                            retrieval.question(),
+                            retrieval.documents(),
+                            sanitized.context()
+                    );
 
-                            return new PreparedContext(
-                                    sanitizedRetrieval,
-                                    sanitized.fileText(),
-                                    outOfScopeKb,
-                                    hasAnyRef,
-                                    guard,
-                                    entityTerms,
+                    return new PreparedContext(
+                            sanitizedRetrieval,
+                            sanitized.fileText(),
+                            outOfScopeKb,
+                            hasAnyRef,
+                            guard,
+                            entityTerms,
                             compressed,
                             sanitized,
                             keyInfo == null ? List.of() : keyInfo,
                             gapResult == null ? new EvidenceGapTools.EvidenceGapResult(List.of(), List.of(), "skipped") : gapResult,
                             outlineResult == null ? new AnswerOutlineTools.OutlineResult(List.of(), "bullets") : outlineResult,
                             assumptionResult == null ? new AssumptionCheckTools.AssumptionResult(List.of(), "low") : assumptionResult,
-                            actionPlanResult == null ? new ActionPlanTools.ActionPlanResult(List.of(), "bullets") : actionPlanResult
+                            actionPlanResult == null ? new ActionPlanTools.ActionPlanResult(List.of(), "bullets") : actionPlanResult,
+                            intentResult == null ? new IntentDetectTools.IntentResult("general", List.of()) : intentResult,
+                            keywordResult == null ? new KeywordExtractTools.KeywordResult(List.of(), "none") : keywordResult
                     );
-                        }
-                );
+                }
+        );
     }
 
     private List<String> extractKeyInfo(String evidence, int limit) {
@@ -1529,7 +1682,9 @@ public class RagAnswerService {
                 new EvidenceGapTools.EvidenceGapResult(List.of(), List.of(), "skipped"),
                 new AnswerOutlineTools.OutlineResult(List.of(), "bullets"),
                 new AssumptionCheckTools.AssumptionResult(List.of(), "low"),
-                new ActionPlanTools.ActionPlanResult(List.of(), "bullets")
+                new ActionPlanTools.ActionPlanResult(List.of(), "bullets"),
+                new IntentDetectTools.IntentResult("general", List.of()),
+                new KeywordExtractTools.KeywordResult(List.of(), "none")
         );
     }
 
@@ -1548,14 +1703,20 @@ public class RagAnswerService {
                                EvidenceGapTools.EvidenceGapResult evidenceGap,
                                AnswerOutlineTools.OutlineResult answerOutline,
                                AssumptionCheckTools.AssumptionResult assumptionResult,
-                               ActionPlanTools.ActionPlanResult actionPlan) {
+                               ActionPlanTools.ActionPlanResult actionPlan,
+                               IntentDetectTools.IntentResult intentResult,
+                               KeywordExtractTools.KeywordResult keywordResult) {
 
         String rawContext = (retrieval == null) ? "" : Optional.ofNullable(retrieval.context()).orElse("");
         String contextText = compactLogContext(rawContext, MAX_CONTEXT_CHARS);
         String compressed = truncate(Optional.ofNullable(compressedContext).orElse(""), MAX_CONTEXT_CHARS);
-        ScopeGuardTools.ScopeGuardResult guard = scopeGuardResult == null
+        ScopeGuardTools.ScopeGuardResult guard0 = scopeGuardResult == null
                 ? ScopeGuardTools.ScopeGuardResult.scopedDefault()
                 : scopeGuardResult;
+        ScopeGuardTools.ScopeGuardResult guard = guard0 == null
+                ? ScopeGuardTools.ScopeGuardResult.scopedDefault()
+                : guard0;
+
         List<String> safeTerms = entityTerms == null ? List.of() : entityTerms;
 
         List<QaCandidate> qaCandidates = extractQaCandidates(retrieval, question);
@@ -1568,21 +1729,6 @@ public class RagAnswerService {
                 .append(", deepThinking=").append(deepThinking)
                 .append(", scopeMode=").append(scopeMode)
                 .append("\n\n");
-
-        if (guard.reason() != null && !guard.reason().isBlank()) {
-            sb.append("Scope note: ").append(guard.reason()).append("\n\n");
-        }
-        if (guard.rewriteHint() != null && !guard.rewriteHint().isBlank()) {
-            sb.append("Rewrite hint: ").append(guard.rewriteHint()).append("\n\n");
-        }
-        if (!guard.scoped()) {
-            if (scopeMode == RagAnswerRequest.ScopeMode.YUQI_ONLY) {
-                sb.append("Instruction: reply exactly with ").append(OUT_OF_SCOPE_REPLY).append(".\n\n");
-            } else {
-                sb.append("Instruction: refuse to provide private contact details; suggest safe public info topics.\n\n");
-            }
-        }
-
         String fileSection = truncate(Optional.ofNullable(fileText).orElse(""), MAX_FILE_CONTEXT_CHARS);
         if (!fileSection.isBlank()) {
             sb.append(fileSection).append("\n\n");
@@ -1601,6 +1747,18 @@ public class RagAnswerService {
                 sb.append("- ").append(item.trim()).append("\n");
             }
             sb.append("\n");
+        }
+
+        if (deepThinking && intentResult != null && intentResult.intent() != null && !intentResult.intent().isBlank()) {
+            sb.append("Intent: ").append(intentResult.intent());
+            if (intentResult.signals() != null && !intentResult.signals().isEmpty()) {
+                sb.append(" (signals: ").append(String.join(", ", intentResult.signals())).append(")");
+            }
+            sb.append("\n\n");
+        }
+
+        if (deepThinking && keywordResult != null && keywordResult.keywords() != null && !keywordResult.keywords().isEmpty()) {
+            sb.append("Keyword hints: ").append(String.join(", ", keywordResult.keywords())).append("\n\n");
         }
 
         if (deepThinking && evidenceGap != null) {
@@ -1963,7 +2121,8 @@ public class RagAnswerService {
             Integer latencyMs,
             boolean outOfScope,
             String error,
-            RagRetrievalResult retrieval
+            RagRetrievalResult retrieval,
+            ToolRunSummary toolSummary
     ) {
         try {
             candidateIngestionService.ingest(
@@ -1976,10 +2135,27 @@ public class RagAnswerService {
                     error,
                     question,
                     answerText,
-                    retrieval == null ? List.of() : retrieval.documents()
+                    retrieval == null ? List.of() : retrieval.documents(),
+                    toolSummary
             );
         } catch (Exception ignored) {
             // Logging must never break answering
         }
+    }
+
+    private ToolRunSummary buildToolSummary(PreparedContext ctx, TrackCorrectTools.TrackResult trackCorrectResult) {
+        if (ctx == null) return null;
+        return new ToolRunSummary(
+                ctx.keyInfo,
+                ctx.evidenceGap,
+                ctx.answerOutline,
+                ctx.assumptionResult,
+                ctx.actionPlan,
+                ctx.scopeGuardResult,
+                ctx.entityTerms,
+                ctx.intentResult,
+                ctx.keywordResult,
+                trackCorrectResult
+        );
     }
 }
